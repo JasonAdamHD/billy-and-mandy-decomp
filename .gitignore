@@ -8,6 +8,8 @@
 !/config.toml
 !/map.csv
 !/build_runner.bat
+!/build_release.bat
+!/Play.bat
 !/recomp_and_test.sh
 !/run_and_capture.ps1
 !/names/

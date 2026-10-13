@@ -11,7 +11,7 @@ public static class Win { [StructLayout(LayoutKind.Sequential)] public struct RE
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags); }
 "@
-$exe = Join-Path $PSScriptRoot 'PS2Recomp\out\build\x64-Debug\ps2xRuntime\ps2EntryRunner.exe'
+$exe = if ($env:PS2X_EXE) { $env:PS2X_EXE } else { Join-Path $PSScriptRoot 'PS2Recomp\out\build\x64-Debug\ps2xRuntime\ps2EntryRunner.exe' }
 $p = Start-Process -FilePath $exe -ArgumentList 'SLUS_214.51' -RedirectStandardOutput run_out.log -RedirectStandardError run_err.log -PassThru -NoNewWindow
 New-Item -ItemType Directory -Force (Join-Path $PSScriptRoot 'shots') | Out-Null
 try {

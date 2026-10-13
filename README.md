@@ -91,13 +91,21 @@ sha256: a01d39a8e63168f89c22dfa60c746de5eed0c6ecdbfc62d59ba3d03d736c72fe
 The recompiler is deterministic, so the same executable, `map.csv`, `config.toml` and PS2Recomp commit always
 produce byte-identical code.
 
-### 5. Run
+### 5. Build the fast version (optional, recommended for playing)
 
-Run it from the repository root, so it finds the game files:
+Step 3 produces a debug build that logs every function call to `ps2_log.txt` (several GB per run) and runs
+slowly. For playing, build an optimised copy without that log:
 
 ```bash
-PS2Recomp/out/build/x64-Debug/ps2xRuntime/ps2EntryRunner.exe SLUS_214.51
+cmd //c build_release.bat
 ```
+
+It compiles into `PS2Recomp/out/build/x64-Fast` (about 20 minutes) and leaves the debug build untouched.
+
+### 6. Run
+
+Double-click `Play.bat`. It runs the fast build if you made one, otherwise the debug build, from the
+repository root so the game finds its files.
 
 ## Controls
 
@@ -127,12 +135,16 @@ Environment variables read by the runtime:
 | `PS2X_PLAY_FMV=1` | Try to play the intro movies instead of skipping them (they cannot be decoded yet) |
 | `PS2X_AUTOPRESS="cross@600,start@800"` | Press buttons at the given number of seconds after launch, for automated testing |
 | `PS2X_DUMP_AT=<hex pc>` with `PS2X_DUMP_RANGE=<hex addr>:<hex size>` | Print guest memory each time a function is called |
+| `PS2X_LOG_PRESENT=1` | Log the display registers and the framebuffer shown for each presented frame |
 
 ## Current state
 
 - Boots to the title screen and main menu (Tutorial, Story Mode, VS Mode, Mission Mode, Options, Extras).
-- **Slow:** booting takes about 11 minutes and the game runs at roughly 2 frames per second. The emulated
-  IOP (the PS2's I/O processor, which streams files and audio) currently runs far below real-time speed.
+- **Slow:** with the fast build, the autosave notice before the title screen appears after about 3 minutes, and
+  the game still runs well below full speed. The emulated IOP (the PS2's I/O processor, which streams files
+  and audio) runs far below real-time speed.
+- **Display workaround:** the game's finished frame never reaches the framebuffer it asks the hardware to
+  show, so the runtime shows its draw buffer and holds the last frame over the moments that buffer is cleared.
 - **Movies are skipped:** the game's FMVs are CRI Sofdec streams decoded by the PS2's IPU (MPEG hardware),
   which the runtime does not emulate yet. `overrides/billy_mandy_overrides.cpp` treats each movie as already
   skipped.
@@ -147,7 +159,9 @@ Environment variables read by the runtime:
 | `overrides/` | Game-specific runtime overrides, compiled into the runner |
 | `tools/ghidra/` | Ghidra scripts used for naming, function recovery and exporting `map.csv` |
 | `tools/hash_output.py` | Fingerprints the generated code (step 4) |
-| `build_runner.bat` | Ninja build of the runner or the recompiler |
+| `build_runner.bat` | Ninja debug build of the runner or the recompiler |
+| `build_release.bat` | Optimised build without the per-call trace log, for playing |
+| `Play.bat` | Launches the game (fast build if present) |
 | `recomp_and_test.sh` | Recompile, sync the generated code, build and optionally run for N seconds |
 | `run_and_capture.ps1` | Run the game for N seconds and save window screenshots to `shots/` |
 | `PS2Recomp/` | Submodule: the recompiler, runtime and IOP emulator, with the fixes this game needs |
