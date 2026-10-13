@@ -1,0 +1,19 @@
+# Allowlist: this folder also holds the game's disc files, the generated C++ (~800 MB), build
+# output, logs and save data, none of which belong in the repository. Only listed paths are tracked.
+/*
+!/.gitignore
+!/.gitattributes
+!/.gitmodules
+!/README.md
+!/config.toml
+!/map.csv
+!/build_runner.bat
+!/recomp_and_test.sh
+!/run_and_capture.ps1
+!/names/
+!/overrides/
+!/tools/
+!/PS2Recomp
+
+__pycache__/
+*.pyc

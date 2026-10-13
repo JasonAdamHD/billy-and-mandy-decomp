@@ -1,0 +1,5 @@
+[submodule "PS2Recomp"]
+	path = PS2Recomp
+	url = https://github.com/JasonAdamHD/PS2Recomp.git
+	branch = billy-mandy-boot
+	ignore = dirty

@@ -1,0 +1,4 @@
+0x004d1d30,AtIoPsx2MemoryCard::vUpdate
+0x004d0fb0,AtIoPsx2MCWriteAsyncOp::bStart
+0x004c9e50,AtIoJamFileSystem::vInit
+0x004d0850,AtIoPsx2MCReadAsyncOp::bStart
