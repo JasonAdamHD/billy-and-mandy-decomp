@@ -145,10 +145,12 @@ Environment variables read by the runtime:
 ## Current state
 
 - Boots to the title screen and main menu (Tutorial, Story Mode, VS Mode, Mission Mode, Options, Extras).
-- **Slow:** with the fast build and the Vulkan renderer, menus run at about 7-10 frames per second and the
-  loading animation up to about 30. VU1 and the IOP (the PS2's I/O processor) are still interpreted.
-- **Flash menu crash:** after some time in the menus, the Flash UI player calls through a corrupted object
-  (indirect call at 0x50e76c) and the game stops. Under investigation.
+- **Menus run at about 60 fps; matches at about 20-35 fps.** In a match the cycle-accurate VU1 interpreter
+  (about 0.3 ms per microprogram, ~2700 programs per second) is the bottleneck.
+- **Matches load**, from character select through the VS screen into the 3D levels.
+- **Sound workaround:** before a match the game sometimes waits forever for a sound whose readiness the IOP
+  sound driver judges from SPU2 voice state the runtime does not emulate. `overrides/billy_mandy_overrides.cpp`
+  gives up on such a sound after 5 seconds (`PS2X_NO_SOUND_WAIT_GUARD=1` disables this).
 - **CPU renderer display workaround:** with `PS2X_GS_CPU=1` the game's finished frame never reaches the
   framebuffer it asks the hardware to show, so that renderer shows its draw buffer instead.
 - **Movies are skipped:** the game's FMVs are CRI Sofdec streams decoded by the PS2's IPU (MPEG hardware),

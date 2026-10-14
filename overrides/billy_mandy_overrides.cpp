@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -31,11 +32,140 @@ namespace
         }
     }
 
+    // AtFpDisplayManager::vAdvanceFrames (0x4ffd30) walks its active Flash levels (list head at manager+8, link at
+    // level+0) in s2 and calls AtFpActionScript::vRunPendingLoadsAndDispatch (0x50e650) on each. Occasionally the
+    // walk reaches level+0x10 instead of a level, and the dispatcher then calls through garbage. Until the cause
+    // is found, check the argument against the manager's level pool (base at manager+4, 0x5b0-byte slots, count
+    // at manager+0x21c), log what the list looked like, and end the walk for this frame instead of crashing.
+    constexpr uint32_t kRunPendingLoadsAndDispatch = 0x0050E650u;
+    constexpr uint32_t kAdvanceFramesReturn = 0x004FFD94u;
+    constexpr uint32_t kLevelSize = 0x5B0u;
+    PS2Runtime::RecompiledFunction g_originalRunPending = nullptr;
+    uint32_t g_zeroWord = 0u;
+
+    uint32_t readGuest32(const uint8_t *rdram, uint32_t address)
+    {
+        uint32_t value = 0u;
+        const uint32_t physical = address & 0x01FFFFFFu;
+        if (physical + sizeof(value) <= PS2_RAM_SIZE)
+            std::memcpy(&value, rdram + physical, sizeof(value));
+        return value;
+    }
+
+    void runPendingLoadsChecked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t level = GPR_U32(ctx, 4);
+        if (GPR_U32(ctx, 31) == kAdvanceFramesReturn)
+        {
+            const uint32_t manager = GPR_U32(ctx, 19); // s3 in vAdvanceFrames
+            const uint32_t pool = readGuest32(rdram, manager + 4u);
+            const uint32_t count = readGuest32(rdram, manager + 0x21Cu);
+            const bool valid = level >= pool && level < pool + count * kLevelSize && ((level - pool) % kLevelSize) == 0u;
+            if (!valid)
+            {
+                static uint32_t reports = 0u;
+                if (reports++ < 20u)
+                {
+                    std::cerr << std::hex << "[billy_mandy] Flash level walk reached 0x" << level << " (pool 0x" << pool
+                              << " x" << count << ", manager 0x" << manager << ") list:";
+                    uint32_t node = readGuest32(rdram, manager + 8u);
+                    for (int i = 0; i < 12 && node != 0u; ++i, node = readGuest32(rdram, node))
+                        std::cerr << " 0x" << node;
+                    std::cerr << " | pending-destroy:";
+                    node = readGuest32(rdram, manager + 0x18u);
+                    for (int i = 0; i < 12 && node != 0u; ++i, node = readGuest32(rdram, node))
+                        std::cerr << " 0x" << node;
+                    std::cerr << std::dec << std::endl;
+                }
+                // vAdvanceFrames continues with s2 = *s2; point s2 at a zero word so this frame's walk ends.
+                if (g_zeroWord == 0u)
+                    g_zeroWord = runtime->guestMalloc(16u, 16u);
+                if (g_zeroWord != 0u)
+                {
+                    const uint32_t zero = 0u;
+                    std::memcpy(rdram + (g_zeroWord & 0x01FFFFFFu), &zero, sizeof(zero));
+                    SET_GPR_U32(ctx, 18, g_zeroWord);
+                }
+                ctx->pc = GPR_U32(ctx, 31);
+                return;
+            }
+        }
+        g_originalRunPending(rdram, ctx, runtime);
+    }
+
+    // GmSoSoundManager::vStartSoundIfNotPlaying (0x2070e0) asks the sound device for a sound and then spins
+    //     do { soundDevice->vUpdateChannelsAndRpc(0.1f); } while (request->status == 0);
+    // with the request at its sp+0x3c. The status is driven by the IOP sound driver, which watches SPU2 voice
+    // state the runtime does not emulate, and occasionally it never leaves 0 - the load before a match then
+    // hangs forever. When the same request has been pending for 5 seconds, mark it failed (2): the game then
+    // releases it and continues without that one sound.
+    constexpr uint32_t kSoundUpdateA = 0x004BA610u;
+    constexpr uint32_t kSoundUpdateB = 0x004BA650u;
+    constexpr uint32_t kStartSoundWaitReturn = 0x00207220u;
+    PS2Runtime::RecompiledFunction g_originalSoundUpdateA = nullptr;
+    PS2Runtime::RecompiledFunction g_originalSoundUpdateB = nullptr;
+
+    void checkStuckSoundRequest(uint8_t *rdram, R5900Context *ctx)
+    {
+        static uint32_t pendingRequest = 0u;
+        static std::chrono::steady_clock::time_point pendingSince{};
+        if (GPR_U32(ctx, 31) != kStartSoundWaitReturn)
+            return;
+        const uint32_t request = readGuest32(rdram, GPR_U32(ctx, 29) + 0x3Cu);
+        if (request == 0u)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        if (request != pendingRequest)
+        {
+            pendingRequest = request;
+            pendingSince = now;
+            return;
+        }
+        if (now - pendingSince < std::chrono::seconds(5))
+            return;
+        const uint32_t statusAddress = (request + 0xCu) & 0x01FFFFFFu;
+        if (rdram[statusAddress] == 0u)
+        {
+            rdram[statusAddress] = 2u;
+            std::cerr << "[billy_mandy] sound request 0x" << std::hex << request << std::dec
+                      << " never became ready; skipping it so loading can continue" << std::endl;
+        }
+        pendingRequest = 0u;
+    }
+
+    void soundUpdateA(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        checkStuckSoundRequest(rdram, ctx);
+        g_originalSoundUpdateA(rdram, ctx, runtime);
+    }
+
+    void soundUpdateB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        checkStuckSoundRequest(rdram, ctx);
+        g_originalSoundUpdateB(rdram, ctx, runtime);
+    }
+
     void applyBillyMandyOverrides(PS2Runtime &runtime)
     {
+        if (std::getenv("PS2X_NO_SOUND_WAIT_GUARD") == nullptr)
+        {
+            g_originalSoundUpdateA = runtime.lookupFunction(kSoundUpdateA);
+            g_originalSoundUpdateB = runtime.lookupFunction(kSoundUpdateB);
+            if (g_originalSoundUpdateA && g_originalSoundUpdateB)
+            {
+                runtime.replaceFunction(kSoundUpdateA, &soundUpdateA);
+                runtime.replaceFunction(kSoundUpdateB, &soundUpdateB);
+            }
+        }
+        if (std::getenv("PS2X_NO_FLASH_GUARD") == nullptr)
+        {
+            g_originalRunPending = runtime.lookupFunction(kRunPendingLoadsAndDispatch);
+            if (g_originalRunPending != nullptr)
+                runtime.replaceFunction(kRunPendingLoadsAndDispatch, &runPendingLoadsChecked);
+        }
         if (std::getenv("PS2X_PLAY_FMV") == nullptr)
             runtime.replaceFunction(kRunPlaybackLoop, &skipVideoPlayback);
     }
 }
 
-PS2_REGISTER_GAME_OVERRIDE("Billy & Mandy: skip Sofdec FMVs", "SLUS_214.51", 0u, 0u, &applyBillyMandyOverrides)
+PS2_REGISTER_GAME_OVERRIDE("Billy & Mandy: skip Sofdec FMVs, guard Flash level walk and stuck sound loads", "SLUS_214.51", 0u, 0u, &applyBillyMandyOverrides)
