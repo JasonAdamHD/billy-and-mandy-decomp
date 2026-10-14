@@ -267,3 +267,57 @@ Each milestone stays behind an env flag with the emulated path as the default un
 - **Batch count:** thousands of 40-vertex batches per frame. Merging is required for good GPU performance.
 - **Textures:** VRAM re-use within a frame (LRU eviction) makes texture identity by TBP unsafe. Content-hash keyed cache with dirty tracking.
 - **parallel-gs hooks:** the boundary copy needs write access to its VRAM buffer; the dependency is pinned and already patched, so this would be another small patch.
+
+## 7. M0 findings (runtime trace, `PS2X_NATIVE_TRACE`)
+
+- **Frame structure.** Display page 0 is the only scanout page. Every frame is drawn into an off-screen
+  page at FBP 0x8c in this order: 3D (VU1 batches, with A+D state packets between them), then 2D/UI sprites
+  (PATH2). At the start of the next frame one sprite copies 0x8c to page 0 (`G2@8cF0D2`), then 0x8c is cleared.
+  The native frame therefore ends at that copy and is shown from page 0 (`ps2native::noteGsDraw`).
+- **Programs actually used.**
+  - Menus: only `IDXSTRPD`/`XFORM1M`, about 35 two-triangle batches per frame (the menu layers are VU1 quads).
+  - Match: about 6.5k batches/s, around 25 triangles each. Mostly `IDXTRID` + `XFORM1MN`, plus `XFORM1M`,
+    `XFORM1MNOD` and a few `IDXSTRPD`. Lighting is always `CALCLIGHT`.
+  - No multi-bone XFORM, toon, particle or water program showed up in the traced scenes. Characters are
+    rigid-skinned through one bone per batch.
+- **VU1 call protocol.**
+  - `MSCAL 0` only resets the output double buffer.
+  - `MSCAL 2` runs the XFORM prologue, which multiplies VP into bones 302-305 in place (`XFORMnM` only; the
+    `MN` variants multiply world then VP per vertex), and then the first batch.
+  - Each following `MSCNT` processes the next input buffer with the same matrices.
+- **Screen mapping.**
+  - window(12.4) = clip.xy / w * qw265.xy + (qw264.xy - 1.5*2^23). The offset is a magic float whose
+    mantissa is the GS fixed-point coordinate.
+  - Z = 16 * qw265.z / w (`FTOI4`).
+
+## 8. Status
+
+**M0 is done.**
+- `overrides/billy_mandy_native.cpp` finds the 35 program descriptors in RDRAM and identifies the resident
+  main, XFORM and lighting programs by comparing VU1 code memory.
+- `PS2X_NATIVE_TRACE=<vsync>[:<n>]` prints the draw stream for `n` vsyncs, plus a per-program histogram every 5 s.
+- `tools/vu1_programs.py` extracts and disassembles the microcode.
+
+**M1 is done (dual-run).** Runtime side (PS2Recomp, `native-renderer` branch):
+- `PS2Runtime::setVu1Hook` and `setGifPacketObserver` give the game code access to the VU1 and GIF streams.
+- `GS::readRawDrawRegisters` returns the GS drawing registers as raw values.
+- `ps2native` (`src/lib/native/`) collects decoded batches per frame and draws them in
+  `ParallelBackend::Present` on the parallel-gs Vulkan device.
+- Shaders are GLSL, compiled to SPIR-V headers at build time by the glslang bundled with Granite.
+
+Game side: `IDXTRID`/`IDXSTRPD` + `XFORM1M`/`1MN`/`1MNOD`/`1MNODN` batches are decoded into object-space
+vertices, vertex colours and ST, plus `VP * bone` and the screen mapping.
+
+How to view it:
+- `PS2X_NATIVE3D=1` draws the native 3D tinted over the emulated frame.
+- `PS2X_NATIVE3D=2` shows the native 3D only.
+
+What it looks like today:
+- Geometry lines up with the emulated scene.
+- It is untextured and unlit (vertex colours only), so lit characters show black.
+- In matches the game produces about 28 distinct frames/s, and native-only mode presents exactly those.
+- The title-bar fps counts changed scanouts.
+- The VU1 interpreter still runs for every batch.
+
+Next (M2): `CALCLIGHT` lighting, the texture cache from GS uploads, GS state to pipeline state (blend, alpha
+test, Z), and batch merging.
