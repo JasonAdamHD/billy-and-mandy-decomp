@@ -145,8 +145,9 @@ Environment variables read by the runtime:
 ## Current state
 
 - Boots to the title screen and main menu (Tutorial, Story Mode, VS Mode, Mission Mode, Options, Extras).
-- **Menus run at about 60 fps; matches at about 20-35 fps.** In a match the cycle-accurate VU1 interpreter
-  (about 0.3 ms per microprogram, ~2700 programs per second) is the bottleneck.
+- **Menus run at 60 fps; matches mostly 51-59 fps**, dipping to the 30s-40s in the heaviest moments (e.g. the
+  four-character countdown). VIF1/VU1/GS work runs on its own graphics thread in parallel with the EE
+  (`PS2X_GFX_THREAD=0` turns this off); that thread's VU1 interpreter is now the limit.
 - **Matches load**, from character select through the VS screen into the 3D levels.
 - **Sound workaround:** before a match the game sometimes waits forever for a sound whose readiness the IOP
   sound driver judges from SPU2 voice state the runtime does not emulate. `overrides/billy_mandy_overrides.cpp`
