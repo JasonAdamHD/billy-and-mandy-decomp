@@ -28,7 +28,7 @@ for ($i = 1; $i -le $Shots; $i++) {
     $g = [System.Drawing.Graphics]::FromImage($bmp); $hdc = $g.GetHdc()
     [void][Win]::PrintWindow($h, $hdc, 2); $g.ReleaseHdc($hdc); $g.Dispose()
     $file = Join-Path $PSScriptRoot ("shots\t{0:D3}s.png" -f ($i * $interval)); $bmp.Save($file); $bmp.Dispose()
-    "saved $file"
+    "saved $file  [$($p.MainWindowTitle)]"
 }
 } finally {
     # Always stop the game, even if a screenshot fails.

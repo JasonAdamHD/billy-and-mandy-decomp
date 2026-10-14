@@ -101,6 +101,8 @@ cmd //c build_release.bat
 ```
 
 It compiles into `PS2Recomp/out/build/x64-Fast` (about 20 minutes) and leaves the debug build untouched.
+The fast build draws with [parallel-gs](https://github.com/Arntzen-Software/parallel-gs), a Vulkan PS2 graphics
+renderer that CMake downloads on the first configure; it needs a Vulkan-capable GPU and driver (no SDK).
 
 ### 6. Run
 
@@ -136,15 +138,19 @@ Environment variables read by the runtime:
 | `PS2X_AUTOPRESS="cross@600,start@800"` | Press buttons at the given number of seconds after launch, for automated testing |
 | `PS2X_DUMP_AT=<hex pc>` with `PS2X_DUMP_RANGE=<hex addr>:<hex size>` | Print guest memory each time a function is called |
 | `PS2X_LOG_PRESENT=1` | Log the display registers and the framebuffer shown for each presented frame |
+| `PS2X_GS_CPU=1` | Use the CPU graphics renderer instead of the Vulkan (parallel-gs) renderer |
+| `PS2X_GS_INTEROP=1` | Show Vulkan frames through a shared OpenGL texture instead of a CPU copy (currently shows black) |
+| `PS2X_GS_THREAD=1` | Run the CPU renderer on its own thread |
 
 ## Current state
 
 - Boots to the title screen and main menu (Tutorial, Story Mode, VS Mode, Mission Mode, Options, Extras).
-- **Slow:** with the fast build, the autosave notice before the title screen appears after about 3 minutes, and
-  the game still runs well below full speed. The emulated IOP (the PS2's I/O processor, which streams files
-  and audio) runs far below real-time speed.
-- **Display workaround:** the game's finished frame never reaches the framebuffer it asks the hardware to
-  show, so the runtime shows its draw buffer and holds the last frame over the moments that buffer is cleared.
+- **Slow:** with the fast build and the Vulkan renderer, menus run at about 7-10 frames per second and the
+  loading animation up to about 30. VU1 and the IOP (the PS2's I/O processor) are still interpreted.
+- **Flash menu crash:** after some time in the menus, the Flash UI player calls through a corrupted object
+  (indirect call at 0x50e76c) and the game stops. Under investigation.
+- **CPU renderer display workaround:** with `PS2X_GS_CPU=1` the game's finished frame never reaches the
+  framebuffer it asks the hardware to show, so that renderer shows its draw buffer instead.
 - **Movies are skipped:** the game's FMVs are CRI Sofdec streams decoded by the PS2's IPU (MPEG hardware),
   which the runtime does not emulate yet. `overrides/billy_mandy_overrides.cpp` treats each movie as already
   skipped.
