@@ -355,6 +355,53 @@ What it looks like today:
 - The 2D full-screen passes are absent, so native-only frames look darker.
 - No batch merging yet: about 350 draws per frame, which is fine so far.
 
-Next:
-- **M3:** `IDXTRIMULTI` second pass, `SPRITEM1`, `PARTICLEM1` and toon/halo.
-- **M4:** composite with the emulated non-VU draws, keeping their order relative to native draws.
+**M3/M4: full native frame (`PS2X_NATIVE3D=4`).**
+- **Not a composite.** The doc's original M4 (boundary copy + untouched-pixel composite) cannot work here:
+  ordinary GS draws are interleaved with the VU1 3D.
+- **What the native frame contains:**
+  - the native VU1 batches, plus
+  - every other GS primitive the game sends to the frame's buffer, replayed natively in stream order
+    (`native_gsreplay.cpp`). The replay covers the PATH2/PATH3 packets, the GIF DMA fast path, and the PATH1
+    output of VU1 programs without a native port.
+- **Effect on M3:** `IDXTRIMULTI`, TOON/HALO, `SPRITEM1` and `PARTICLEM1` are drawn exactly through the
+  replay, so porting them is now only a speed item; they run at tens to hundreds of batches/s. Their decode
+  specs are in the session scratch (`spec_idx_multipass.md`, `spec_sprite_particle.md`) and summarised in
+  section 9.
+- **Frame bookkeeping.** The page the game copies to the display is the native draw buffer. Draws into the
+  display page (the copy itself) and into render-target pages are left to the emulated GS. None were seen in
+  matches (`PS2X_NATIVE_REPLAYSTATS=1`).
+- **VU memory writeback.** Some batches read VU memory that earlier program runs left behind (colours in the
+  input buffer, lighting accumulators). When a handled batch skips the interpreter, the override writes those
+  side effects back. Batches the VU would trivially reject (every vertex outside the same clip plane) are
+  dropped exactly like the VU drops them. Without this, statues and characters rendered black.
+- **Culling.** `IDXTRID` cull variants (entry bit 1) back-face cull with the VU's rule: keep when the
+  window-space cross product is > 0. Strip culling is not done yet.
+- **`PS2X_NATIVE_SPLIT=1`** (with mode 2) shows the emulated frame on the left and the native frame on the
+  right, for same-frame comparison.
+- **Speed.** In matches the game draws 52-57 frames/s, with VU1 interpreter time near zero.
+
+**Open:**
+- A speckled ground decal under characters.
+- `IDXSTRPD` cull variants.
+- Points/lines in the replay (none seen).
+- Reflection texgen (mode 256).
+- Render-to-texture sampling, if a level uses it.
+- Upscaling: the native target still matches the 640x448 scanout.
+
+## 9. M3 program notes (from the disassembly, for later speed ports)
+- **MULTI/STRPMUL.** Pass 1 is the base emit, with qw301.x selecting the second UV set (zw of 161+). Pass 2
+  re-emits every triangle with tag qw318, colour qw319, finalize selected by qw299.z, and ST via qw318.x/w
+  and affine qw322/323.
+- **TOON/HALO.** Per batch, in this order:
+  1. An outline of back-facing triangles (S <= 0), with xy offset by floor(worldNormal.xy * qw256.w), using
+     colour/tag from qw256-258.
+  2. The main pass, front faces only.
+  3. The optional second pass.
+
+  HALO adds ALPHA_2 = Cs + Cd before the outline.
+- **SPRITEM1.** Up to 10 sprites per buffer:
+  - the centre is at 81+4k and the axes at 201/202+4k;
+  - corners are c +/- B +/- A with UV (0,0)..(1,1), and all corners share Q = 1/clip0.w;
+  - the output is a tri-strip with ADC on the first two vertices.
+- **PARTICLEM1 / PARTDIST.** One qw per particle (xyz, t). Size and colour come from polynomials in qw328-336.
+  PARTDIST emits 2-vertex sprites with screen-space UVs.

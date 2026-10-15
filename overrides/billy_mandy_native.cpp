@@ -86,6 +86,7 @@ namespace
         float viewProj[16]{};
         int bones = 1; // of the resident XFORM program
         bool haveMatrix = false;
+        bool writeBack = false; // handled batches skip the interpreter, so their VU memory side effects are applied here
 
         // PS2X_NATIVE_VERIFY: last batch's colours, checked against the VU's output at the next call.
         bool verify = false;
@@ -527,6 +528,29 @@ namespace
         }
         s.pending.base = base;
         s.pending.count = vertexCount;
+
+        // The VU drops the whole batch (no lighting, no finalize, no output) when every vertex is outside the same
+        // clip plane: AND of the CLIP flags (x > w, x < -w, y > w, y < -w, z > w, z < -w) non-zero.
+        uint32_t clipAnd = 63u;
+        for (uint32_t i = 0; i < vertexCount && clipAnd; ++i)
+        {
+            const float *m = batch.objectToClip;
+            const float *pp = batch.vertices[i].pos;
+            float clip[4];
+            for (int r = 0; r < 4; ++r)
+                clip[r] = m[r] * pp[0] + m[4 + r] * pp[1] + m[8 + r] * pp[2] + m[12 + r];
+            const float w = std::fabs(clip[3]);
+            uint32_t flags = 0;
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                flags |= (clip[axis] > w ? 1u : 0u) << (axis * 2);
+                flags |= (clip[axis] < -w ? 2u : 0u) << (axis * 2);
+            }
+            clipAnd &= flags;
+        }
+        const bool rejected = clipAnd != 0u;
+
+        uint8_t *vuMutable = s.writeBack ? s.runtime->memory().getVU1Data() : nullptr;
         for (uint32_t i = 0; i < vertexCount; ++i)
         {
             int32_t c[4];
@@ -537,6 +561,33 @@ namespace
             batch.vertices[i].rgba = gsColor(out);
         }
         s.havePending = s.verify;
+
+        // When the interpreter is skipped, leave VU memory as the program would: later batches read some of it
+        // back (colours left in the input buffer, lighting accumulators, world normals and positions).
+        if (vuMutable && !rejected)
+        {
+            const bool keepsLit = finalize == 4 || finalize == 5;
+            for (uint32_t i = 0; i < vertexCount; ++i)
+            {
+                std::memcpy(vuMutable + ((base + kInColors + i) & 0x3ffu) * 16u, s.pending.colors[i], 16);
+                float world4[4] = {world[i][0], world[i][1], world[i][2], 0.0f};
+                std::memcpy(vuMutable + ((328u + i) & 0x3ffu) * 16u, world4, 12);
+                if (normals != 0)
+                {
+                    float n4[4] = {normal[i][0], normal[i][1], normal[i][2], 0.0f};
+                    std::memcpy(vuMutable + ((base + kInNormals + i) & 0x3ffu) * 16u, n4, 12);
+                }
+                if (lit)
+                {
+                    float a[4];
+                    for (int c = 0; c < 4; ++c)
+                        a[c] = keepsLit ? std::min(std::max(acc[i][c], 0.0f), 255.0f) : acc[i][c];
+                    std::memcpy(vuMutable + ((976u + i) & 0x3ffu) * 16u, a, 16);
+                }
+            }
+        }
+        if (rejected)
+            return true; // nothing drawn, exactly like the VU
 
         // UV variants (entry index bit 0): texgen selected by GIF-tag w bits 8-10, then an optional 2x3 affine.
         if (mainVariant >= 0 && (mainVariant & 1) != 0)
@@ -608,10 +659,32 @@ namespace
         if (kind == MainKind::IdxTri)
         {
             const uint32_t triangles = std::min<uint32_t>(uint32_t(header[0]), 80u);
+            // Entry index bit 1: the face-culled emit routine keeps a triangle iff its window-space cross product
+            // (p1 - p0) x (p2 - p0) is positive.
+            const bool cull = mainVariant >= 0 && (mainVariant & 2) != 0;
+            float window[kMaxBatchVertices][2];
+            if (cull)
+                for (uint32_t i = 0; i < vertexCount; ++i)
+                {
+                    const float *m = batch.objectToClip;
+                    const float *p = batch.vertices[i].pos;
+                    float clip[4];
+                    for (int r = 0; r < 4; ++r)
+                        clip[r] = m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r];
+                    window[i][0] = clip[0] / clip[3] * scale[0];
+                    window[i][1] = clip[1] / clip[3] * scale[1];
+                }
             for (uint32_t t = 0; t < triangles; ++t)
             {
                 int32_t idx[4];
                 readInts(vu, base + kInIndices + t, idx);
+                if (cull && uint32_t(idx[0]) < vertexCount && uint32_t(idx[1]) < vertexCount && uint32_t(idx[2]) < vertexCount)
+                {
+                    const float *p0 = window[idx[0]], *p1 = window[idx[1]], *p2 = window[idx[2]];
+                    const float area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+                    if (!(area > 0.0f))
+                        continue;
+                }
                 addTriangle(idx[0], idx[1], idx[2]);
             }
         }
@@ -837,7 +910,7 @@ namespace
                 if (freshCall)
                     captureMatrix(s, vu);
                 if (s.haveMatrix && decodeBatch(s, vu, event.itop, kind, dequantize, normals))
-                    return ps2native::mode() == ps2native::Mode::Replace && !s.verify;
+                    return ps2native::replacesVu1() && !s.verify;
             }
         }
         return false; // the interpreter still runs (dual-run until the emulated 3D is dropped)
@@ -846,6 +919,9 @@ namespace
     void onGifPacket(uint32_t path, const uint8_t *data, uint32_t size)
     {
         State &s = g_state;
+        // Full native frame: everything else drawn into the frame (including VU1 output of programs without a
+        // native port) is replayed in stream order.
+        ps2native::replayGif(path, data, size);
         if (path == 1u || size < 16u)
             return; // PATH1 is the VU1 output (no transfers), already traced as V: tokens
         if (ps2native::enabled())
@@ -921,6 +997,11 @@ namespace
         traceToken(s, buf);
     }
 
+    bool readGsRegisters(GSRawDrawRegisters &out)
+    {
+        return g_state.runtime && g_state.runtime->gs().readRawDrawRegisters(out);
+    }
+
     void applyNativeRenderer(PS2Runtime &runtime)
     {
         State &s = g_state;
@@ -933,10 +1014,12 @@ namespace
             s.traceEnd = s.traceBegin + (colon ? std::strtoull(colon + 1, nullptr, 10) : 3ull);
         }
         s.verify = std::getenv("PS2X_NATIVE_VERIFY") != nullptr && ps2native::enabled();
+        s.writeBack = ps2native::replacesVu1() && !s.verify;
         if (!s.trace && !ps2native::enabled())
             return;
         runtime.setVu1Hook(&onVu1);
         runtime.setGifPacketObserver(&onGifPacket);
+        ps2native::setRegisterSource(&readGsRegisters);
         std::fprintf(stderr, "[native] VU1 hook installed (trace=%d, mode=%d)\n", s.trace ? 1 : 0, int(ps2native::mode()));
     }
 }
