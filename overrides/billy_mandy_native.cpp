@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -59,8 +60,14 @@ namespace
     struct Program
     {
         std::string name;
-        uint32_t slot = 0;              // instruction index of its first MPG chunk
-        std::vector<uint8_t> signature; // first bytes of that chunk
+        uint32_t slot = 0; // instruction index of its first MPG chunk
+        struct Chunk
+        {
+            uint32_t dest = 0; // instruction index
+            std::vector<uint8_t> code;
+        };
+        std::vector<Chunk> chunks; // all of its microcode (programs can share a prologue, so all of it is compared)
+        size_t size = 0;
         uint16_t entries[16]{};         // descriptor entry table (+0x18)
     };
 
@@ -82,9 +89,12 @@ namespace
         // Captured at MSCAL: object -> clip for the current bone (VP * bone 0).
         float objectToClip[16]{};
         float bone[16]{}; // object -> world (bone 0 as uploaded, before the XFORM prologue)
-        float bone2[16]{}; // bone 1 (XFORM2M)
+        float bone2[16]{}; // bone 1 (XFORM2M/2MN/3M)
+        float bone3[16]{}; // bone 2 (XFORM3M)
         float viewProj[16]{};
         int bones = 1; // of the resident XFORM program
+        bool freshCall = false; // the batch being decoded started with MSCAL (or the MSCNT after the init call)
+        int callVariant = -1;   // main-program variant chosen by that MSCAL
         bool haveMatrix = false;
         bool writeBack = false; // handled batches skip the interpreter, so their VU memory side effects are applied here
 
@@ -96,6 +106,8 @@ namespace
             float colors[kMaxBatchVertices][4];
             float st[kMaxBatchVertices][2];
             float screen[kMaxBatchVertices][2]; // window coords as the VU stores them (magic offset included)
+            int32_t stInput[kMaxBatchVertices][4];
+            bool fresh = false;
             int mainVariant = -1;
             uint32_t flags = 0;
             float uv[8]{};          // qw320-321 as read at decode time
@@ -148,7 +160,10 @@ namespace
             std::memcpy(&qwc, ram + addr + 0x14u, 2);
             if (packet < 0x00100000u || packet + qwc * 16u > 0x00600000u || qwc == 0u)
                 continue;
-            // Walk the VIF packet to its first MPG.
+            // Walk the VIF packet, collecting its MPG chunks.
+            Program p;
+            p.name.assign(name + 3, len - 3);
+            std::memcpy(p.entries, ram + addr + 0x18u, sizeof(p.entries));
             for (uint32_t pos = 0; pos + 4u <= qwc * 16u;)
             {
                 const uint32_t code = readU32(ram + packet + pos);
@@ -162,18 +177,23 @@ namespace
                 if (cmd == 0x4au) // MPG
                 {
                     const uint32_t count = ((code >> 16) & 0xffu) ? ((code >> 16) & 0xffu) : 256u;
-                    const uint32_t bytes = std::min<uint32_t>(count * 8u, 256u);
-                    Program p;
-                    p.name.assign(name + 3, len - 3);
-                    p.slot = code & 0xffffu;
-                    p.signature.assign(ram + packet + pos, ram + packet + pos + bytes);
-                    std::memcpy(p.entries, ram + addr + 0x18u, sizeof(p.entries));
-                    s.programs.push_back(std::move(p));
-                    break;
+                    if (pos + count * 8u > qwc * 16u)
+                        break;
+                    Program::Chunk chunk;
+                    chunk.dest = code & 0xffffu;
+                    chunk.code.assign(ram + packet + pos, ram + packet + pos + count * 8u);
+                    if (p.chunks.empty())
+                        p.slot = chunk.dest;
+                    p.size += chunk.code.size();
+                    p.chunks.push_back(std::move(chunk));
+                    pos += count * 8u;
+                    continue;
                 }
-                if (cmd != 0x00u && cmd != 0x01u && cmd != 0x05u)
+                if (cmd != 0x00u && cmd != 0x01u && cmd != 0x05u && cmd != 0x10u && cmd != 0x11u && cmd != 0x13u)
                     break;
             }
+            if (!p.chunks.empty())
+                s.programs.push_back(std::move(p));
         }
         std::fprintf(stderr, "[native] found %zu VU1 programs\n", s.programs.size());
     }
@@ -189,13 +209,24 @@ namespace
         for (int k = 0; k < 3; ++k)
         {
             s.current[k] = -1;
+            size_t best = 0;
             for (size_t i = 0; i < s.programs.size(); ++i)
             {
                 const Program &p = s.programs[i];
-                if (p.slot == slots[k] && std::memcmp(code + p.slot * 8u, p.signature.data(), p.signature.size()) == 0)
+                if (p.slot != slots[k] || p.size <= best)
+                    continue;
+                bool match = true;
+                for (const auto &chunk : p.chunks)
+                    if (chunk.dest * 8u + chunk.code.size() > PS2_VU1_CODE_SIZE ||
+                        std::memcmp(code + chunk.dest * 8u, chunk.code.data(), chunk.code.size()) != 0)
+                    {
+                        match = false;
+                        break;
+                    }
+                if (match)
                 {
                     s.current[k] = int(i);
-                    break;
+                    best = p.size;
                 }
             }
         }
@@ -221,11 +252,12 @@ namespace
     bool supportedXform(State &s, bool &dequantize, int &normals)
     {
         const char *name = programName(s, 1);
-        if (std::strcmp(name, "XFORM2M") == 0)
+        // Blended skinning: XFORM2M, XFORM2MN (s8 normals), XFORM3M.
+        if (std::strcmp(name, "XFORM2M") == 0 || std::strcmp(name, "XFORM2MN") == 0 || std::strcmp(name, "XFORM3M") == 0)
         {
             dequantize = true;
-            normals = 0;
-            s.bones = 2;
+            normals = std::strcmp(name, "XFORM2MN") == 0 ? 1 : 0;
+            s.bones = name[5] - '0';
             return true;
         }
         if (std::strncmp(name, "XFORM1M", 7) != 0 || std::strstr(name, "EXTN") != nullptr)
@@ -252,22 +284,88 @@ namespace
     }
 
     // M = VP * B, both stored as four column quadwords (the VU computes ACC = c0*x + c1*y + c2*z + c3*w).
-    void captureMatrix(State &s, const uint8_t *vu)
+    // Column-major 4x4 helpers.
+    void multiply(const float *a, const float *b, float *out)
     {
-        float vp[16], bone[16];
-        std::memcpy(vp, qw(vu, kQwViewProj), 64);
-        std::memcpy(bone, qw(vu, kQwBones), 64);
-        std::memcpy(s.bone, bone, sizeof(s.bone));
-        std::memcpy(s.bone2, qw(vu, kQwBones + 4u), 64);
-        std::memcpy(s.viewProj, vp, sizeof(s.viewProj));
         for (int col = 0; col < 4; ++col)
             for (int row = 0; row < 4; ++row)
             {
                 float sum = 0.0f;
                 for (int k = 0; k < 4; ++k)
-                    sum += vp[k * 4 + row] * bone[col * 4 + k];
-                s.objectToClip[col * 4 + row] = sum;
+                    sum += a[k * 4 + row] * b[col * 4 + k];
+                out[col * 4 + row] = sum;
             }
+    }
+
+    bool invert(const float *m, float *out)
+    {
+        double a[4][8];
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+            {
+                a[r][c] = m[c * 4 + r];
+                a[r][c + 4] = r == c ? 1.0 : 0.0;
+            }
+        for (int c = 0; c < 4; ++c)
+        {
+            int pivot = c;
+            for (int r = c + 1; r < 4; ++r)
+                if (std::fabs(a[r][c]) > std::fabs(a[pivot][c]))
+                    pivot = r;
+            if (std::fabs(a[pivot][c]) < 1e-20)
+                return false;
+            std::swap(a[c], a[pivot]);
+            const double inv = 1.0 / a[c][c];
+            for (int k = 0; k < 8; ++k)
+                a[c][k] *= inv;
+            for (int r = 0; r < 4; ++r)
+                if (r != c)
+                {
+                    const double f = a[r][c];
+                    for (int k = 0; k < 8; ++k)
+                        a[r][k] -= f * a[c][k];
+                }
+        }
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 4; ++c)
+                out[c * 4 + r] = float(a[r][c + 4]);
+        return true;
+    }
+
+    // The matrices the VU transforms this batch with. XFORMnM programs (1M, 1MNOD, 2M, 3M) run a prologue on
+    // MSCAL that multiplies VP into the bones in place; later MSCNT batches use bone memory as it is (normally
+    // those premultiplied values, but the EE may have uploaded new raw bones meanwhile). The normal-carrying
+    // programs multiply by VP per vertex every batch. Bones as world matrices come out as VP^-1 * clip matrix.
+    void captureMatrix(State &s, uint8_t *vu, bool freshCall, bool prologue, bool writeBack)
+    {
+        float vp[16];
+        std::memcpy(vp, qw(vu, kQwViewProj), 64);
+        std::memcpy(s.viewProj, vp, sizeof(s.viewProj));
+        float vpInverse[16];
+        const bool haveInverse = prologue && invert(vp, vpInverse);
+        float *world[3] = {s.bone, s.bone2, s.bone3};
+        for (int k = 0; k < 3; ++k)
+        {
+            float memory[16], clip[16];
+            std::memcpy(memory, qw(vu, kQwBones + 4u * uint32_t(k)), 64);
+            if (prologue && !freshCall)
+                std::memcpy(clip, memory, sizeof(clip));
+            else
+                multiply(vp, memory, clip);
+            if (k == 0)
+                std::memcpy(s.objectToClip, clip, sizeof(clip));
+            if (prologue)
+            {
+                if (freshCall && writeBack && k < s.bones)
+                    std::memcpy(vu + ((kQwBones + 4u * uint32_t(k)) & 0x3ffu) * 16u, clip, 64); // the prologue's in-place write
+                if (haveInverse)
+                    multiply(vpInverse, clip, world[k]);
+                else
+                    std::memcpy(world[k], memory, 64);
+            }
+            else
+                std::memcpy(world[k], memory, 64);
+        }
         s.haveMatrix = true;
     }
 
@@ -407,7 +505,7 @@ namespace
             return false;
 
         ps2native::Batch batch;
-        std::memcpy(batch.objectToClip, s.bones == 2 ? s.viewProj : s.objectToClip, sizeof(batch.objectToClip));
+        std::memcpy(batch.objectToClip, s.bones >= 2 ? s.viewProj : s.objectToClip, sizeof(batch.objectToClip));
         float scale[4], offset[4];
         readVec(vu, kQwScreenScale, scale);
         readVec(vu, kQwScreenOffset, offset);
@@ -453,7 +551,10 @@ namespace
         // Which variant the main program runs: bit 0 of its entry index = UV transform, bit 2 = lighting.
         int32_t entries[4];
         readInts(vu, kQwEntries, entries);
-        const int mainVariant = entryIndex(s, 0, uint32_t(entries[0]) & 1023u);
+        // MSCNT batches continue in the variant chosen at MSCAL (only qw299.y is re-read per batch).
+        if (s.freshCall)
+            s.callVariant = entryIndex(s, 0, uint32_t(entries[0]) & 1023u);
+        const int mainVariant = s.callVariant;
         const bool lit = mainVariant >= 0 && (mainVariant & 4) != 0;
         if (mainVariant >= 0 && (mainVariant & 1) != 0)
             ++s.uvTransform;
@@ -479,21 +580,25 @@ namespace
                 readVec(vu, base + kInPositions + i, p);
                 std::memcpy(v.pos, p, sizeof(v.pos));
             }
-            for (int r = 0; r < 3; ++r)
-                world[i][r] = s.bone[r] * v.pos[0] + s.bone[4 + r] * v.pos[1] + s.bone[8 + r] * v.pos[2] + s.bone[12 + r];
-            if (s.bones == 2)
+            // Bone weights: 2 bones w0 = x / 255, w1 = 1 - w0; 3 bones w0 = x / 255, w1 = y / 255, w2 = 1 - w0 - w1.
+            float weights[3] = {1.0f, 0.0f, 0.0f};
+            if (s.bones >= 2)
             {
-                // XFORM2M: w * bone0 + (1 - w) * bone1, w = weight / 255; the GPU then applies VP alone.
                 int32_t weight[4];
                 readInts(vu, base + kInWeights + i, weight);
-                const float w = float(weight[0]) * 0.00392157f;
-                for (int r = 0; r < 3; ++r)
-                {
-                    const float b1 = s.bone2[r] * v.pos[0] + s.bone2[4 + r] * v.pos[1] + s.bone2[8 + r] * v.pos[2] + s.bone2[12 + r];
-                    world[i][r] = world[i][r] * w + b1 * (1.0f - w);
-                }
-                std::memcpy(v.pos, world[i], sizeof(v.pos));
+                weights[0] = float(weight[0]) * 0.00392157f;
+                weights[1] = s.bones == 3 ? float(weight[1]) * 0.00392157f : 1.0f - weights[0];
+                weights[2] = s.bones == 3 ? 1.0f - (weights[0] + weights[1]) : 0.0f;
             }
+            const float *bones[3] = {s.bone, s.bone2, s.bone3};
+            for (int r = 0; r < 3; ++r)
+            {
+                world[i][r] = 0.0f;
+                for (int k = 0; k < s.bones; ++k)
+                    world[i][r] += weights[k] * (bones[k][r] * v.pos[0] + bones[k][4 + r] * v.pos[1] + bones[k][8 + r] * v.pos[2] + bones[k][12 + r]);
+            }
+            if (s.bones >= 2)
+                std::memcpy(v.pos, world[i], sizeof(v.pos)); // the GPU then applies VP alone
             float n[3] = {0.0f, 0.0f, 0.0f};
             if (normals == 1)
             {
@@ -509,11 +614,25 @@ namespace
                 std::memcpy(n, nf, sizeof(n));
             }
             for (int r = 0; r < 3; ++r)
-                normal[i][r] = s.bone[r] * n[0] + s.bone[4 + r] * n[1] + s.bone[8 + r] * n[2];
-            int32_t st[4];
-            readInts(vu, base + kInST + i, st);
-            v.st[0] = float(st[0]) / 4096.0f;
-            v.st[1] = float(st[1]) / 4096.0f;
+            {
+                normal[i][r] = 0.0f;
+                for (int k = 0; k < s.bones; ++k)
+                    normal[i][r] += weights[k] * (bones[k][r] * n[0] + bones[k][4 + r] * n[1] + bones[k][8 + r] * n[2]);
+            }
+            if (dequantize)
+            {
+                int32_t st[4];
+                readInts(vu, base + kInST + i, st);
+                v.st[0] = float(st[0]) / 4096.0f; // ITOF12
+                v.st[1] = float(st[1]) / 4096.0f;
+            }
+            else
+            {
+                float st[4]; // the float-input transforms (NOD) take ST as floats too
+                readVec(vu, base + kInST + i, st);
+                v.st[0] = st[0];
+                v.st[1] = st[1];
+            }
         }
 
         const bool hemisphere = std::strcmp(programName(s, 2), "CALCLIGHT") != 0;
@@ -637,6 +756,9 @@ namespace
             for (int c = 0; c < 2; ++c)
                 s.pending.screen[i][c] = clip[c] / clip[3] * scale[c] + offset[c];
         }
+        for (uint32_t i = 0; i < vertexCount; ++i)
+            readInts(vu, base + kInST + i, s.pending.stInput[i]);
+        s.pending.fresh = s.freshCall;
         s.pending.mainVariant = mainVariant;
         s.pending.flags = uint32_t(tag[1] >> 32);
         std::snprintf(s.pending.programs, sizeof(s.pending.programs), "%s/%s", programName(s, 0), programName(s, 1));
@@ -656,35 +778,37 @@ namespace
             }
         };
 
+        // Entry index bit 1 selects the face-culled emit routine. Lists keep a triangle iff its window-space
+        // cross product (p1 - p0) x (p2 - p0) is positive; strips use the same orientation with alternating sign.
+        const bool cull = mainVariant >= 0 && (mainVariant & 2) != 0;
+        float window[kMaxBatchVertices][2];
+        if (cull)
+            for (uint32_t i = 0; i < vertexCount; ++i)
+            {
+                const float *m = batch.objectToClip;
+                const float *p = batch.vertices[i].pos;
+                float clip[4];
+                for (int r = 0; r < 4; ++r)
+                    clip[r] = m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r];
+                window[i][0] = clip[0] / clip[3] * scale[0];
+                window[i][1] = clip[1] / clip[3] * scale[1];
+            }
+        auto orientation = [&](int32_t a, int32_t b, int32_t c)
+        {
+            const float *p0 = window[a], *p1 = window[b], *p2 = window[c];
+            return (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
+        };
+
         if (kind == MainKind::IdxTri)
         {
             const uint32_t triangles = std::min<uint32_t>(uint32_t(header[0]), 80u);
-            // Entry index bit 1: the face-culled emit routine keeps a triangle iff its window-space cross product
-            // (p1 - p0) x (p2 - p0) is positive.
-            const bool cull = mainVariant >= 0 && (mainVariant & 2) != 0;
-            float window[kMaxBatchVertices][2];
-            if (cull)
-                for (uint32_t i = 0; i < vertexCount; ++i)
-                {
-                    const float *m = batch.objectToClip;
-                    const float *p = batch.vertices[i].pos;
-                    float clip[4];
-                    for (int r = 0; r < 4; ++r)
-                        clip[r] = m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r];
-                    window[i][0] = clip[0] / clip[3] * scale[0];
-                    window[i][1] = clip[1] / clip[3] * scale[1];
-                }
             for (uint32_t t = 0; t < triangles; ++t)
             {
                 int32_t idx[4];
                 readInts(vu, base + kInIndices + t, idx);
-                if (cull && uint32_t(idx[0]) < vertexCount && uint32_t(idx[1]) < vertexCount && uint32_t(idx[2]) < vertexCount)
-                {
-                    const float *p0 = window[idx[0]], *p1 = window[idx[1]], *p2 = window[idx[2]];
-                    const float area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
-                    if (!(area > 0.0f))
-                        continue;
-                }
+                if (cull && uint32_t(idx[0]) < vertexCount && uint32_t(idx[1]) < vertexCount && uint32_t(idx[2]) < vertexCount &&
+                    !(orientation(idx[0], idx[1], idx[2]) > 0.0f))
+                    continue;
                 addTriangle(idx[0], idx[1], idx[2]);
             }
         }
@@ -706,7 +830,18 @@ namespace
                     list[k] = idx[k & 3u];
                 }
                 for (uint32_t k = 2; k < n; ++k)
+                {
+                    // The VU sets ADC on vertex k when the sign of the orientation differs from k's parity:
+                    // even k keeps orientation >= 0, odd k keeps orientation < 0.
+                    if (cull && uint32_t(list[k - 2]) < vertexCount && uint32_t(list[k - 1]) < vertexCount && uint32_t(list[k]) < vertexCount)
+                    {
+                        const float z = orientation(list[k - 2], list[k - 1], list[k]);
+                        const bool negative = std::signbit(z);
+                        if (negative != ((k & 1u) != 0u))
+                            continue;
+                    }
                     addTriangle(list[k - 2], list[k - 1], list[k]);
+                }
                 indexQw += (n + 3u) / 4u;
             }
         }
@@ -818,13 +953,15 @@ namespace
             // The VU overwrote the input positions (+81) with window coordinates.
             float vuPos[4];
             std::memcpy(vuPos, qw(vu, s.pending.base + kInPositions + i), 16);
-            // (IDXSTRPD keeps other data there, so only IDXTRID batches are compared.)
-            const float posError = std::strncmp(s.pending.programs, "IDXTRID/", 8) != 0 ? 0.0f : std::max(std::fabs(vuPos[0] - s.pending.screen[i][0]), std::fabs(vuPos[1] - s.pending.screen[i][1]));
+            // (IDXSTRPD keeps other data there, so only IDXTRID batches are compared; vertices behind the camera
+            // (VU depth <= 0) are skipped, since near w = 0 the divide amplifies rounding and the GPU clips them.)
+            const bool comparable = std::strncmp(s.pending.programs, "IDXTRID/", 8) == 0 && vuPos[2] > 0.0f;
+            const float posError = !comparable ? 0.0f : std::max(std::fabs(vuPos[0] - s.pending.screen[i][0]), std::fabs(vuPos[1] - s.pending.screen[i][1]));
             if (posError > 2.0f) // GS 12.4 units: 1/8 pixel
             {
                 if (s.posMismatched < 10)
-                    std::fprintf(stderr, "[native-verify] pos %s variant %d vertex %u/%u: native (%.1f %.1f) vu (%.1f %.1f %.1f %.1f)\n",
-                                 s.pending.programs, s.pending.mainVariant, i, s.pending.count, s.pending.screen[i][0],
+                    std::fprintf(stderr, "[native-verify] pos %s fresh %d variant %d vertex %u/%u: native (%.1f %.1f) vu (%.1f %.1f %.1f %.1f)\n",
+                                 s.pending.programs, s.pending.fresh ? 1 : 0, s.pending.mainVariant, i, s.pending.count, s.pending.screen[i][0],
                                  s.pending.screen[i][1], vuPos[0], vuPos[1], vuPos[2], vuPos[3]);
                 ++s.posMismatched;
             }
@@ -836,9 +973,10 @@ namespace
             if (stError > 1e-3f)
             {
                 if (s.stMismatched < 12)
-                    std::fprintf(stderr, "[native-verify] st %s variant %d flags 0x%x vertex %u: native (%g %g) vu (%g %g)\n",
+                    std::fprintf(stderr, "[native-verify] st %s variant %d flags 0x%x vertex %u: native (%g %g) vu (%g %g) input (%d %d %d %d) 301.x 0x%08x\n",
                                  s.pending.programs, s.pending.mainVariant, s.pending.flags, i, s.pending.st[i][0],
-                                 s.pending.st[i][1], vuSt[0], vuSt[1]);
+                                 s.pending.st[i][1], vuSt[0], vuSt[1], s.pending.stInput[i][0], s.pending.stInput[i][1],
+                                 s.pending.stInput[i][2], s.pending.stInput[i][3], readU32(qw(vu, kQwGifTag)));
                 if (s.stMismatched < 3)
                 {
                     float now[8];
@@ -907,8 +1045,11 @@ namespace
             int normals = 0;
             if (kind != MainKind::Other && supportedXform(s, dequantize, normals))
             {
-                if (freshCall)
-                    captureMatrix(s, vu);
+                const char *xform = programName(s, 1);
+                const bool prologue = std::strcmp(xform, "XFORM1M") == 0 || std::strcmp(xform, "XFORM1MNOD") == 0 ||
+                                      std::strcmp(xform, "XFORM2M") == 0 || std::strcmp(xform, "XFORM3M") == 0;
+                captureMatrix(s, s.runtime->memory().getVU1Data(), freshCall, prologue, s.writeBack);
+                s.freshCall = freshCall;
                 if (s.haveMatrix && decodeBatch(s, vu, event.itop, kind, dequantize, normals))
                     return ps2native::replacesVu1() && !s.verify;
             }

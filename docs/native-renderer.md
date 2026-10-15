@@ -380,13 +380,47 @@ What it looks like today:
   right, for same-frame comparison.
 - **Speed.** In matches the game draws 52-57 frames/s, with VU1 interpreter time near zero.
 
+**Fixes after M4:**
+- **Speckled ground decal.** The float-input transforms (`XFORM1MNOD`/`MNODN`) take ST as floats, not 4.12
+  fixed point.
+- **Strip culling.** Vertex k keeps orientation >= 0 when k is even and < 0 when k is odd (the VU's ADC rule).
+- **Program identification.** Programs are identified by their full microcode, since several share a prologue.
+- **VU matrix semantics are mirrored:**
+  - On MSCAL, prologue programs use VP * bones; on MSCNT they use bone memory as it is.
+  - The normal-carrying programs use VP * bones every batch.
+  - Replace mode applies the prologue's in-place write.
+  - MSCNT batches keep the variant chosen at MSCAL.
+- **Skinning.** Generalised to `XFORM2M`, `XFORM2MN` and `XFORM3M`. Weights are qw241.x/255 and qw241.y/255;
+  the last bone gets the remainder.
+- **Black regions in gameplay.** Large dark foreground walls appear in the emulated frame too (split view).
+  The game draws them that way.
+
+**Levels checked** in `PS2X_NATIVE3D=4`:
+- Egyptian Tomb and Underworld ("Deep in Evil", chosen with `down` twice on the level screen).
+- Menus, character select, battle setup, loading and VS screens.
+
+Underworld runs the VU1 interpreter harder (about 830 ms/s; game at 23-40 frames/s). The cause is the
+remaining unported programs: `IDXTRIMULTI`, `PARTICLEM1`, `SPRITEM1` and `XFORM4M`/`EXTN`.
+
+**Known verification noise** (`PS2X_NATIVE_VERIFY`, Underworld):
+- Colours are exact.
+- Some `XFORM1M` MSCNT batches differ in position, but every sampled vertex is far off-screen on both sides.
+- Some 4-vertex `IDXSTRPD` HUD strips differ in ST; their GIF tag shows that nothing was emitted.
+
+**Fast test input.** Gameplay starts at about 160 s instead of 490 s:
+
+```
+PS2X_AUTOPRESS=cross@25,cross@32,cross@38,cross@44,start@49,cross@53,cross@56,cross@59,cross@62,cross@65,cross@68,cross@71,cross@74,cross@77,cross@80,cross@83,start@88,cross@95,cross@109,cross@113,start@119,start@124,cross@139,cross@149,cross@161,cross@171
+```
+
+Insert `down@102,down@105` after `cross@95` for the Underworld level.
+
 **Open:**
-- A speckled ground decal under characters.
-- `IDXSTRPD` cull variants.
 - Points/lines in the replay (none seen).
 - Reflection texgen (mode 256).
-- Render-to-texture sampling, if a level uses it.
-- Upscaling: the native target still matches the 640x448 scanout.
+- Render-to-texture sampling (none seen).
+- Speed ports for `IDXTRIMULTI`/`PARTICLEM1`/`SPRITEM1`.
+- Upscaling: the native target is still 640x448.
 
 ## 9. M3 program notes (from the disassembly, for later speed ports)
 - **MULTI/STRPMUL.** Pass 1 is the base emit, with qw301.x selecting the second UV set (zw of 161+). Pass 2
