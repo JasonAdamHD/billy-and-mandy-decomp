@@ -395,17 +395,47 @@ What it looks like today:
 - **Black regions in gameplay.** Large dark foreground walls appear in the emulated frame too (split view).
   The game draws them that way.
 
-**Levels checked** in `PS2X_NATIVE3D=4`:
-- Egyptian Tomb and Underworld ("Deep in Evil", chosen with `down` twice on the level screen).
-- Menus, character select, battle setup, loading and VS screens.
+**Speed ports: `IDXTRIMULTI`/`IDXSTRPMUL`, `SPRITEM1`, `PARTICLEM1`.**
+- **MULTI programs.** Pass 1 is the base decode. In UV variants with texgen mode 0, ST is reloaded from the
+  UV set the tag selects (low 16 bits of qw301.x non-zero means the zw lanes of 161+).
+  Pass 2 is a second batch with the same triangles and culling:
+  - tag qw318;
+  - colours from the finalize entry at qw299.z, run with material qw319 on pass 1's float colours;
+  - ST through the qw318 rules, with affine rows qw322/323.
 
-Underworld runs the VU1 interpreter harder (about 830 ms/s; game at 23-40 frames/s). The cause is the
-remaining unported programs: `IDXTRIMULTI`, `PARTICLEM1`, `SPRITEM1` and `XFORM4M`/`EXTN`.
+  `finalizeColor` now takes the colour quadword's raw bits. The ITOF0 entries read them as integers, entries 6
+  and 8 read them as floats, and entry 7 clamps lit at 0 only.
+- **SPRITEM1 and PARTICLEM1** project their quads on the CPU and submit screen-space batches with exactly
+  the GS vertices the VU would kick. MSCNT state is mirrored:
+  - SPRITEM1's flags come from the qw299.y read at the end of the previous batch, and the pass count is fixed
+    at MSCAL.
+  - PARTICLEM1's matrix, corner UVs and GIF tag come from the MSCAL prologue.
+  - The prologue and transform addresses in qw301.x/w carry the tag's EOP bit; JR uses the low 11 bits.
+  - Only strip and fan PRIMs are handled. Anything else falls back to the interpreter, and so do batches with
+    unexpected headers or modes.
+- **Kick verification.** With `PS2X_NATIVE_VERIFY`, the expected sprite and particle GS packets are queued
+  and compared with the VU's PATH1 output: xy within 2/16 pixel, RGBA within 1, STQ within 1e-3. In
+  Underworld, 45,699 kicks (1.41M vertices) matched with 0 mismatches, 0 missing and none declined (reasons
+  are counted under `declined:`). The MULTI pass-2 colours are exact (0 colour mismatches over 46M vertices).
+- **Speed.** In Underworld the VU1 interpreter time fell from about 830 ms/s to 0 ms/s, and the game now
+  runs at 54-59 frames/s instead of 23-40.
+
+**Levels checked** in `PS2X_NATIVE3D=4`:
+- Egyptian Tomb, Underworld ("Deep in Evil", `down` twice on the level screen) and Warlockery and
+  Sorcerizing ("The Office", `down` three times; 38-58 frames/s, VU1 interpreter idle).
+- Coliseum of Chaos (`down` once) shows only the HUD. That level's 3D is black with the native renderer off
+  too (the log reports `COLIS4\CAMERA.ADR` not found), so it is an emulation issue, not a native one.
+- Menus, character select, battle setup, loading and VS screens.
+- When the camera leaves The Office's floating tower, the native frame draws a sky wedge where the emulated
+  frame is black (split view). The pre-port build shows the same difference.
 
 **Known verification noise** (`PS2X_NATIVE_VERIFY`, Underworld):
 - Colours are exact.
 - Some `XFORM1M` MSCNT batches differ in position, but every sampled vertex is far off-screen on both sides.
 - Some 4-vertex `IDXSTRPD` HUD strips differ in ST; their GIF tag shows that nothing was emitted.
+- ST is read back from the shared qw368+ scratch, which later batches can overwrite before the check.
+  About 10-17% of vertices "mismatch" this way, before and after the ports. Kick verification is the reliable
+  check for the screen-space programs.
 
 **Fast test input.** Gameplay starts at about 160 s instead of 490 s:
 
@@ -413,13 +443,15 @@ remaining unported programs: `IDXTRIMULTI`, `PARTICLEM1`, `SPRITEM1` and `XFORM4
 PS2X_AUTOPRESS=cross@25,cross@32,cross@38,cross@44,start@49,cross@53,cross@56,cross@59,cross@62,cross@65,cross@68,cross@71,cross@74,cross@77,cross@80,cross@83,start@88,cross@95,cross@109,cross@113,start@119,start@124,cross@139,cross@149,cross@161,cross@171
 ```
 
-Insert `down@102,down@105` after `cross@95` for the Underworld level.
+Insert `down@102,down@105` after `cross@95` for the Underworld level. Sprites and particles mostly appear
+in combat, so repeated `cross`/`square` presses from 140 s help. `PS2X_HIDE_DEBUG=1` hides the runtime
+debug panel, which otherwise covers screenshots.
 
 **Open:**
 - Points/lines in the replay (none seen).
 - Reflection texgen (mode 256).
 - Render-to-texture sampling (none seen).
-- Speed ports for `IDXTRIMULTI`/`PARTICLEM1`/`SPRITEM1`.
+- Speed ports for TOON/HALO, `PARTDIST` and `XFORM4M`/`EXTN` (not seen at a significant rate yet).
 - Upscaling: the native target is still 640x448.
 
 ## 9. M3 program notes (from the disassembly, for later speed ports)

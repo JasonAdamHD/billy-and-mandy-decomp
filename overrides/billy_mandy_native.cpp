@@ -48,6 +48,9 @@ namespace
     constexpr uint32_t kQwGifTag = 301u;
     constexpr uint32_t kQwBones = 302u;
     constexpr uint32_t kQwUvMatrix = 320u; // two rows: s' = r0.x*s + r1.x*t + r0.w, t' = r0.y*s + r1.y*t + r1.w
+    constexpr uint32_t kQwGifTag2 = 318u;   // second pass (MULTI, SPRITEM1 entry 30): GIF tag
+    constexpr uint32_t kQwMaterial2 = 319u; // MULTI second pass material
+    constexpr uint32_t kQwUvMatrix2 = 322u; // second pass UV affine rows
     // Input buffer layout relative to the buffer base (XITOP).
     constexpr uint32_t kInIndices = 1u;
     constexpr uint32_t kInPositions = 81u;
@@ -74,8 +77,22 @@ namespace
     enum class MainKind : uint8_t
     {
         Other,
-        IdxTri,   // VU1IDXTRID
-        IdxStrip, // VU1IDXSTRPD
+        IdxTri,      // VU1IDXTRID
+        IdxStrip,    // VU1IDXSTRPD
+        IdxTriMulti, // VU1IDXTRIMULTI: IDXTRID plus a second material pass
+        IdxStripMul, // VU1IDXSTRPMUL: IDXSTRPD plus a second material pass
+        Sprite,      // VU1SPRITEM1: camera-facing quads
+        Particle,    // VU1PARTICLEM1: particle quads
+    };
+
+    bool isStrip(MainKind kind) { return kind == MainKind::IdxStrip || kind == MainKind::IdxStripMul; }
+    bool isMulti(MainKind kind) { return kind == MainKind::IdxTriMulti || kind == MainKind::IdxStripMul; }
+
+    // A GS vertex as a VU program kicks it (kick verification of the screen-space ports).
+    struct KickVertex
+    {
+        uint32_t x = 0, y = 0, z = 0, rgba = 0;
+        float s = 0.0f, t = 0.0f, q = 0.0f;
     };
 
     struct State
@@ -116,9 +133,26 @@ namespace
         } pending;
         bool havePending = false;
         uint64_t verified = 0, mismatched = 0, skipped = 0, stMismatched = 0, posMismatched = 0;
+        std::map<std::string, uint64_t> stMismatchedBy; // by main/xform program
         float maxError = 0.0f, maxStError = 0.0f, maxPosError = 0.0f;
         uint64_t unsupportedLight = 0, uvTransform = 0, unsupportedTexgen = 0;
         bool afterInit = false; // last MSCAL was the init entry, so the next MSCNT starts a fresh call
+
+        // SPRITEM1 / PARTICLEM1 state kept in VU registers across MSCNT.
+        uint32_t spriteFlags = 0;   // qw299.y as the program read it at the end of the previous batch
+        bool spriteTwoPass = false; // entry 30 (second pass from qw318) chosen at MSCAL
+        float particleMatrix[16]{}; // VP * bone, built by the MSCAL prologue
+        float particleUv[4][2]{};   // corner UVs (affine'd by prologue 698)
+        uint64_t particleTag[2]{};  // qw301 as loaded at MSCAL
+        bool particleReady = false;
+
+        // PS2X_NATIVE_VERIFY: GS packets the screen-space ports expect the VU to kick, in order.
+        std::mutex kickMutex;
+        std::vector<std::vector<KickVertex>> expectedKicks;
+        size_t expectedNext = 0;
+        char kickProgram[16]{};
+        uint64_t kicksVerified = 0, kicksMismatched = 0, kicksMissing = 0, kickVertices = 0;
+        std::map<std::string, uint64_t> declined; // screen-space batches left to the interpreter, by reason
 
         // Trace.
         bool trace = false;
@@ -244,6 +278,14 @@ namespace
             return MainKind::IdxTri;
         if (std::strcmp(name, "IDXSTRPD") == 0)
             return MainKind::IdxStrip;
+        if (std::strcmp(name, "IDXTRIMULTI") == 0)
+            return MainKind::IdxTriMulti;
+        if (std::strcmp(name, "IDXSTRPMUL") == 0)
+            return MainKind::IdxStripMul;
+        if (std::strcmp(name, "SPRITEM1") == 0)
+            return MainKind::Sprite;
+        if (std::strcmp(name, "PARTICLEM1") == 0)
+            return MainKind::Particle;
         return MainKind::Other;
     }
 
@@ -450,15 +492,18 @@ namespace
         }
     }
 
-    // VU1CALCLIGHT finalize entries, by index in the program's entry table (qw299.y selects one):
+    // VU1CALCLIGHT finalize entries, by index in the program's entry table (qw299.y selects one; the MULTI
+    // programs' second pass uses qw299.z on the first pass's float colours). raw = the colour quadword's bits:
+    // the ITOF0 entries read it as integers, 6 and 8 as floats.
     // 0 material, 1 vertex*material, 2 lit*material, 3 lit*vertex*material, 4/5 as 0/1 (lit kept for a second
     // pass), 6 untouched, 7 lit*material + vertex*material, 8 colour*material.
-    void finalizeColor(int variant, const int32_t vcolInt[4], const float lit[4], const float mat[4], float out[4])
+    void finalizeColor(int variant, const int32_t raw[4], const float lit[4], const float mat[4], float out[4])
     {
-        float vcol[4], a[4];
+        float vcol[4], bits[4], a[4];
+        std::memcpy(bits, raw, sizeof(bits));
         for (int c = 0; c < 4; ++c)
         {
-            vcol[c] = float(vcolInt[c]);
+            vcol[c] = float(raw[c]); // ITOF0
             a[c] = std::min(std::max(lit[c], 0.0f), 255.0f);
         }
         for (int c = 0; c < 4; ++c)
@@ -475,14 +520,42 @@ namespace
             case 3:
                 out[c] = a[c] * (vcol[c] * mat[c]);
                 break;
-            case 7:
-                out[c] = std::min(c < 3 ? a[c] * mat[c] + vcol[c] * mat[c] : vcol[c] * mat[c], 255.0f);
+            case 6:
+                out[c] = bits[c];
                 break;
-            default: // 1, 5, and the cases that keep or rescale existing colours
+            case 7: // lit is only clamped below at 0 here
+                out[c] = std::min(c < 3 ? std::max(lit[c], 0.0f) * mat[c] + vcol[c] * mat[c] : vcol[c] * mat[c], 255.0f);
+                break;
+            case 8:
+                out[c] = bits[c] * mat[c];
+                break;
+            default: // 1, 5
                 out[c] = vcol[c] * mat[c];
                 break;
             }
         }
+    }
+
+    // The MULTI programs' ST reload: ITOF12 of the vertex ST block, UV set 0 (xy lanes) or, when the selector
+    // (low 16 bits of the GIF tag's first word) is non-zero, set 1 (zw lanes).
+    void reloadSt(const uint8_t *vu, uint32_t base, uint32_t count, uint32_t selector, float (*st)[2])
+    {
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            int32_t in[4];
+            readInts(vu, base + kInST + i, in);
+            const int lane = (selector & 0xffffu) ? 2 : 0;
+            st[i][0] = float(in[lane]) / 4096.0f;
+            st[i][1] = float(in[lane + 1]) / 4096.0f;
+        }
+    }
+
+    // GS window coordinate from a VU float that carries the 1.5 * 2^23 bias: XYZ2 takes the low 16 bits.
+    uint32_t windowBits(float biased)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &biased, 4);
+        return bits & 0xffffu;
     }
 
     uint32_t gsColor(const float c[4])
@@ -669,6 +742,19 @@ namespace
         }
         const bool rejected = clipAnd != 0u;
 
+        // MULTI programs: after the first pass the finalize entry at qw299.z runs again with material qw319 on the
+        // first pass's (float) colours, and the same triangles are drawn with GIF tag qw318.
+        const bool multi = isMulti(kind);
+        const int finalize2 = multi ? entryIndex(s, 2, uint32_t(entries[2]) & 0xffffu) : -1;
+        uint64_t tag2[2] = {0, 0};
+        float material2[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (multi)
+        {
+            std::memcpy(tag2, qw(vu, kQwGifTag2), 16);
+            readVec(vu, kQwMaterial2, material2);
+        }
+        uint32_t rgba2[kMaxBatchVertices];
+
         uint8_t *vuMutable = s.writeBack ? s.runtime->memory().getVU1Data() : nullptr;
         for (uint32_t i = 0; i < vertexCount; ++i)
         {
@@ -676,16 +762,23 @@ namespace
             readInts(vu, base + kInColors + i, c);
             float out[4];
             finalizeColor(finalize, c, acc[i], material, out);
-            std::memcpy(s.pending.colors[i], out, sizeof(out));
             batch.vertices[i].rgba = gsColor(out);
+            if (multi)
+            {
+                int32_t raw[4];
+                std::memcpy(raw, out, sizeof(raw));
+                finalizeColor(finalize2, raw, acc[i], material2, out);
+                rgba2[i] = gsColor(out);
+            }
+            std::memcpy(s.pending.colors[i], out, sizeof(out));
         }
         s.havePending = s.verify;
+        const bool keepsLit = finalize == 4 || finalize == 5 || finalize2 == 4 || finalize2 == 5;
 
         // When the interpreter is skipped, leave VU memory as the program would: later batches read some of it
         // back (colours left in the input buffer, lighting accumulators, world normals and positions).
         if (vuMutable && !rejected)
         {
-            const bool keepsLit = finalize == 4 || finalize == 5;
             for (uint32_t i = 0; i < vertexCount; ++i)
             {
                 std::memcpy(vuMutable + ((base + kInColors + i) & 0x3ffu) * 16u, s.pending.colors[i], 16);
@@ -708,44 +801,75 @@ namespace
         if (rejected)
             return true; // nothing drawn, exactly like the VU
 
-        // UV variants (entry index bit 0): texgen selected by GIF-tag w bits 8-10, then an optional 2x3 affine.
-        if (mainVariant >= 0 && (mainVariant & 1) != 0)
+        // ST per pass. UV variants (entry index bit 0): texgen selected by GIF-tag w bits 8-10 (mode 0 keeps the
+        // vertex ST; MULTI reloads it from the UV set its tag selects), then an optional 2x3 affine (rows qw320/321,
+        // qw322/323 for the second pass). Other variants keep XFORM's ST; the MULTI second pass reloads it.
+        const bool uvVariant = mainVariant >= 0 && (mainVariant & 1) != 0;
+        float xformSt[kMaxBatchVertices][2];
+        for (uint32_t i = 0; i < vertexCount; ++i)
         {
-            const uint32_t flags = uint32_t(tag[1] >> 32);
+            xformSt[i][0] = batch.vertices[i].st[0];
+            xformSt[i][1] = batch.vertices[i].st[1];
+        }
+        auto passSt = [&](bool second, const uint64_t passTag[2], uint32_t rows, float (*st)[2])
+        {
+            const uint32_t selector = uint32_t(passTag[0]) & 0xffffu;
+            const uint32_t flags = uint32_t(passTag[1] >> 32);
+            if (!uvVariant)
+            {
+                if (second)
+                    reloadSt(vu, base, vertexCount, selector, st);
+                else
+                    std::memcpy(st, xformSt, sizeof(float) * 2u * vertexCount);
+                return;
+            }
             const uint32_t texgen = flags & 1792u;
+            if (texgen == 0u && multi)
+                reloadSt(vu, base, vertexCount, selector, st);
+            else
+                std::memcpy(st, xformSt, sizeof(float) * 2u * vertexCount);
             if (texgen == 256u)
                 ++s.unsupportedTexgen; // reflection mapping (ESIN), not ported yet
             for (uint32_t i = 0; i < vertexCount; ++i)
             {
-                ps2native::Vertex &v = batch.vertices[i];
-                if (texgen == 1024u) // lit intensity ramp
+                if (texgen == 1024u) // lit intensity ramp from the accumulators as left in qw976+
                 {
-                    v.st[0] = std::min(std::max(acc[i][0], 0.0f), 255.0f) * 0.00390625f;
-                    v.st[1] = 0.0f;
+                    st[i][0] = (keepsLit ? std::min(std::max(acc[i][0], 0.0f), 255.0f) : acc[i][0]) * 0.00390625f;
+                    st[i][1] = 0.0f;
                 }
                 else if (texgen != 0u && texgen != 256u) // transformed normal
                 {
-                    v.st[0] = normal[i][0];
-                    v.st[1] = normal[i][1];
+                    st[i][0] = normal[i][0];
+                    st[i][1] = normal[i][1];
                 }
             }
             if (flags & 63u)
             {
                 float r0[4], r1[4];
-                readVec(vu, kQwUvMatrix, r0);
-                readVec(vu, kQwUvMatrix + 1u, r1);
+                readVec(vu, rows, r0);
+                readVec(vu, rows + 1u, r1);
                 std::memcpy(s.pending.uv, r0, 16);
                 std::memcpy(s.pending.uv + 4, r1, 16);
-                s.pending.rawSt[0] = batch.vertices[0].st[0];
-                s.pending.rawSt[1] = batch.vertices[0].st[1];
-                for (auto &v : batch.vertices)
+                s.pending.rawSt[0] = st[0][0];
+                s.pending.rawSt[1] = st[0][1];
+                for (uint32_t i = 0; i < vertexCount; ++i)
                 {
-                    const float s0 = v.st[0], t0 = v.st[1];
-                    v.st[0] = r0[0] * s0 + r1[0] * t0 + r0[3];
-                    v.st[1] = r0[1] * s0 + r1[1] * t0 + r1[3];
+                    const float s0 = st[i][0], t0 = st[i][1];
+                    st[i][0] = r0[0] * s0 + r1[0] * t0 + r0[3];
+                    st[i][1] = r0[1] * s0 + r1[1] * t0 + r1[3];
                 }
             }
+        };
+        float st1[kMaxBatchVertices][2], st2[kMaxBatchVertices][2];
+        passSt(false, tag, kQwUvMatrix, st1);
+        for (uint32_t i = 0; i < vertexCount; ++i)
+        {
+            batch.vertices[i].st[0] = st1[i][0];
+            batch.vertices[i].st[1] = st1[i][1];
         }
+        if (multi)
+            passSt(true, tag2, kQwUvMatrix2, st2);
+        const float (*lastSt)[2] = multi ? st2 : st1;
         for (uint32_t i = 0; i < vertexCount; ++i)
         {
             const float *m = batch.objectToClip;
@@ -760,12 +884,12 @@ namespace
             readInts(vu, base + kInST + i, s.pending.stInput[i]);
         s.pending.fresh = s.freshCall;
         s.pending.mainVariant = mainVariant;
-        s.pending.flags = uint32_t(tag[1] >> 32);
+        s.pending.flags = uint32_t((multi ? tag2[1] : tag[1]) >> 32);
         std::snprintf(s.pending.programs, sizeof(s.pending.programs), "%s/%s", programName(s, 0), programName(s, 1));
         for (uint32_t i = 0; i < vertexCount; ++i)
         {
-            s.pending.st[i][0] = batch.vertices[i].st[0];
-            s.pending.st[i][1] = batch.vertices[i].st[1];
+            s.pending.st[i][0] = lastSt[i][0];
+            s.pending.st[i][1] = lastSt[i][1];
         }
 
         auto addTriangle = [&](int32_t a, int32_t b, int32_t c)
@@ -799,7 +923,7 @@ namespace
             return (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
         };
 
-        if (kind == MainKind::IdxTri)
+        if (!isStrip(kind))
         {
             const uint32_t triangles = std::min<uint32_t>(uint32_t(header[0]), 80u);
             for (uint32_t t = 0; t < triangles; ++t)
@@ -845,9 +969,490 @@ namespace
                 indexQw += (n + 3u) / 4u;
             }
         }
-        if (!batch.indices.empty())
+        if (batch.indices.empty())
+            return true;
+        if (multi)
+        {
+            ps2native::Batch second = batch;
+            second.prim = ((tag2[0] >> 46) & 1u) ? ((tag2[0] >> 47) & 0x7ffu) : batch.regs.prim;
+            second.texture = nullptr;
+            if ((second.prim >> 4) & 1u)
+            {
+                const unsigned ctx = unsigned(second.prim >> 9) & 1u;
+                second.texture = ps2native::requestTexture(second.regs.tex0[ctx], second.regs.texa);
+            }
+            for (uint32_t i = 0; i < vertexCount; ++i)
+            {
+                second.vertices[i].rgba = rgba2[i];
+                second.vertices[i].st[0] = st2[i][0];
+                second.vertices[i].st[1] = st2[i][1];
+            }
+            ps2native::submit(std::move(batch));
+            ps2native::submit(std::move(second));
+        }
+        else
             ps2native::submit(std::move(batch));
         return true;
+    }
+
+    // --- Screen-space ports (SPRITEM1, PARTICLEM1) ----------------------------------------------------------
+    // These programs project quads themselves and kick them as GS vertices, so they are decoded to screen-space
+    // batches with exactly the values the VU would kick (see docs/native-renderer.md, sec. 9).
+
+    void transformPoint(const float *m, const float p[3], float clip[4])
+    {
+        for (int r = 0; r < 4; ++r)
+            clip[r] = m[12 + r] + m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2];
+    }
+
+    // CLIP flags against |w| (6 bits, as FCGET & 63).
+    uint32_t clipFlags(const float clip[4])
+    {
+        const float w = std::fabs(clip[3]);
+        uint32_t flags = 0;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            flags |= (clip[axis] > w ? 1u : 0u) << (axis * 2);
+            flags |= (clip[axis] < -w ? 2u : 0u) << (axis * 2);
+        }
+        return flags;
+    }
+
+    // Window transform: xy = clip.xy * S * Q + O (the offset carries the 12.4 bias), Z = FTOI4(K * Q).
+    void toWindow(const float clip[4], float q, const float scale[4], const float offset[4], KickVertex &k)
+    {
+        k.x = windowBits(clip[0] * scale[0] * q + offset[0]);
+        k.y = windowBits(clip[1] * scale[1] * q + offset[1]);
+        k.z = uint32_t(int32_t(scale[2] * q * 16.0f));
+    }
+
+    uint64_t tagPrim(const uint64_t tag[2], const GSRawDrawRegisters &regs)
+    {
+        return ((tag[0] >> 46) & 1u) ? ((tag[0] >> 47) & 0x7ffu) : regs.prim;
+    }
+
+    // Quads (4 kicked vertices each, the first two with ADC) as one screen-space batch. Only strips and fans
+    // are handled; anything else is left to the interpreter.
+    bool quadPrimSupported(uint64_t prim)
+    {
+        return (prim & 7u) == 4u || (prim & 7u) == 5u;
+    }
+
+    void submitQuads(State &s, const GSRawDrawRegisters &regs, uint64_t prim, const std::vector<KickVertex> &verts)
+    {
+        if (verts.empty())
+            return;
+        ps2native::Batch batch;
+        batch.screenSpace = true;
+        batch.regs = regs;
+        batch.prim = prim;
+        batch.debugTag = uint32_t(s.current[0] * 64);
+        if ((prim >> 4) & 1u)
+        {
+            const unsigned ctx = unsigned(prim >> 9) & 1u;
+            batch.texture = ps2native::requestTexture(regs.tex0[ctx], regs.texa);
+        }
+        batch.vertices.resize(verts.size());
+        for (size_t i = 0; i < verts.size(); ++i)
+        {
+            ps2native::Vertex &v = batch.vertices[i];
+            v.pos[0] = float(verts[i].x);
+            v.pos[1] = float(verts[i].y);
+            v.pos[2] = float(verts[i].z);
+            v.rgba = verts[i].rgba;
+            v.st[0] = verts[i].s;
+            v.st[1] = verts[i].t;
+            v.q = verts[i].q;
+        }
+        const bool fan = (prim & 7u) == 5u;
+        for (uint16_t q = 0; q + 3u < verts.size(); q += 4u)
+        {
+            const uint16_t tri[6] = {q, uint16_t(q + 1), uint16_t(q + 2), fan ? q : uint16_t(q + 1), uint16_t(q + 2), uint16_t(q + 3)};
+            batch.indices.insert(batch.indices.end(), tri, tri + 6);
+        }
+        ps2native::submit(std::move(batch));
+    }
+
+    bool decline(State &s, const char *reason)
+    {
+        if (s.verify)
+        {
+            std::lock_guard<std::mutex> lock(s.kickMutex);
+            ++s.declined[std::string(programName(s, 0)) + ":" + reason];
+        }
+        return false;
+    }
+
+    void expectKick(State &s, const std::vector<KickVertex> &verts)
+    {
+        if (!s.verify)
+            return;
+        std::lock_guard<std::mutex> lock(s.kickMutex);
+        s.expectedKicks.push_back(verts);
+        std::snprintf(s.kickProgram, sizeof(s.kickProgram), "%s", programName(s, 0));
+    }
+
+    // VU1SPRITEM1: up to 10 camera-facing quads per batch.
+    bool decodeSprites(State &s, const uint8_t *vu, uint32_t base)
+    {
+        int32_t entries[4];
+        readInts(vu, kQwEntries, entries);
+        if (s.freshCall)
+        {
+            s.spriteFlags = uint32_t(entries[1]) & 0xffffu;
+            s.spriteTwoPass = entryIndex(s, 0, uint32_t(entries[0]) & 0xffffu) >= 8;
+        }
+        const uint32_t flags = s.spriteFlags;
+        s.spriteFlags = uint32_t(entries[1]) & 0xffffu; // re-read at the end of every batch, for the next MSCNT
+
+        int32_t header[4];
+        readInts(vu, base, header);
+        const uint32_t count = uint32_t(header[0]);
+        if (count == 0u || count > 16u || uint32_t(header[1]) != count * 4u)
+            return decline(s, "header");
+
+        GSRawDrawRegisters regs;
+        s.runtime->gs().readRawDrawRegisters(regs);
+        uint64_t tag[2], tag2[2];
+        std::memcpy(tag, qw(vu, kQwGifTag), 16);
+        std::memcpy(tag2, qw(vu, kQwGifTag2), 16);
+        const uint64_t prim = tagPrim(tag, regs), prim2 = tagPrim(tag2, regs);
+        if (!quadPrimSupported(prim) || (s.spriteTwoPass && !quadPrimSupported(prim2)))
+        {
+            char reason[32];
+            std::snprintf(reason, sizeof(reason), "prim%u", unsigned(prim & 7u));
+            return decline(s, reason);
+        }
+
+        float vp[16], bone[16], m[16];
+        std::memcpy(vp, qw(vu, kQwViewProj), 64);
+        std::memcpy(bone, qw(vu, kQwBones), 64);
+        multiply(vp, bone, m);
+        float scale[4], offset[4], material[4], u368[4], u369[4];
+        readVec(vu, kQwScreenScale, scale);
+        readVec(vu, kQwScreenOffset, offset);
+        readVec(vu, kQwMaterial, material);
+        readVec(vu, 368u, u368);
+        readVec(vu, 369u, u369);
+
+        // Corner colours (flags 8: per corner; 16: sprite 0's, but from the third sprite on the VU reads its own
+        // already-converted floats back as integers; 32: one colour at +161; default: sprite 0's corners).
+        float colors[16][4][4];
+        for (uint32_t k = 0; k < count; ++k)
+            for (uint32_t i = 0; i < 4u; ++i)
+            {
+                int32_t raw[4];
+                if (flags & 8u)
+                    readInts(vu, base + kInColors + 4u * k + i, raw);
+                else if ((flags & 16u) && k >= 2u)
+                    std::memcpy(raw, colors[0][i], sizeof(raw));
+                else if (!(flags & 16u) && (flags & 32u))
+                    readInts(vu, base + kInST, raw);
+                else
+                    readInts(vu, base + kInColors + i, raw);
+                for (int c = 0; c < 4; ++c)
+                    colors[k][i][c] = float(raw[c]) * material[c];
+            }
+
+        // Corner positions: centre +/- the two axes (flags 2: both scaled by +201.x and swapped; 4: scaled by
+        // +201.y / .x; default the qw368 / qw369 axes as they are).
+        uint32_t clipAnd = 63u;
+        float clip[16][4][4];
+        uint32_t vflags[16][4];
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            float centre[4], scaleIn[4], a[3], b[3];
+            readVec(vu, base + kInPositions + 4u * k, centre);
+            readVec(vu, base + kInNormals + 4u * k, scaleIn);
+            for (int c = 0; c < 3; ++c)
+            {
+                if (flags & 2u)
+                {
+                    a[c] = u369[c] * scaleIn[0];
+                    b[c] = u368[c] * scaleIn[0];
+                }
+                else if (flags & 4u)
+                {
+                    a[c] = u369[c] * scaleIn[1];
+                    b[c] = u368[c] * scaleIn[0];
+                }
+                else
+                {
+                    a[c] = u368[c];
+                    b[c] = u369[c];
+                }
+            }
+            for (uint32_t i = 0; i < 4u; ++i)
+            {
+                float p[3];
+                for (int c = 0; c < 3; ++c)
+                {
+                    const float side = i < 2u ? centre[c] + b[c] : centre[c] - b[c];
+                    p[c] = (i & 1u) ? side + a[c] : side - a[c];
+                }
+                transformPoint(m, p, clip[k][i]);
+                vflags[k][i] = clipFlags(clip[k][i]);
+                clipAnd &= vflags[k][i];
+            }
+        }
+        if (clipAnd != 0u)
+            return true; // the whole batch is outside one plane: nothing kicked
+
+        auto emitPass = [&](const uint64_t passTag[2], uint32_t rows, uint64_t passPrim)
+        {
+            // Corner UVs (0,0) (1,0) (0,1) (1,1), through the 2x3 affine when the tag's w flags ask for it.
+            float uv[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
+            if ((passTag[1] >> 32) & 63u)
+            {
+                float r0[4], r1[4];
+                readVec(vu, rows, r0);
+                readVec(vu, rows + 1u, r1);
+                for (auto &c : uv)
+                {
+                    const float u = c[0], v = c[1];
+                    c[0] = r0[0] * u + r1[0] * v + r0[3];
+                    c[1] = r0[1] * u + r1[1] * v + r1[3];
+                }
+            }
+            std::vector<KickVertex> verts;
+            verts.reserve(count * 4u);
+            for (uint32_t k = 0; k < count; ++k)
+            {
+                if (vflags[k][0] | vflags[k][1] | vflags[k][2] | vflags[k][3])
+                    continue; // any flagged corner drops the sprite
+                const float q = 1.0f / clip[k][0][3]; // one divide per sprite: every corner uses corner 0's Q
+                for (uint32_t i = 0; i < 4u; ++i)
+                {
+                    KickVertex kv;
+                    toWindow(clip[k][i], q, scale, offset, kv);
+                    kv.rgba = gsColor(colors[k][i]);
+                    kv.s = uv[i][0] * q;
+                    kv.t = uv[i][1] * q;
+                    kv.q = q;
+                    verts.push_back(kv);
+                }
+            }
+            expectKick(s, verts);
+            submitQuads(s, regs, passPrim, verts);
+        };
+        emitPass(tag, kQwUvMatrix, prim);
+        if (s.spriteTwoPass)
+            emitPass(tag2, kQwUvMatrix2, prim2);
+        return true;
+    }
+
+    // VU1PARTICLEM1: one quad per particle, sized and coloured by its parameter t. The MSCAL prologue builds the
+    // matrix and corner UVs and loads the GIF tag; MSCNT batches reuse them.
+    bool decodeParticles(State &s, const uint8_t *vu, uint32_t base)
+    {
+        if (s.freshCall)
+        {
+            std::memcpy(s.particleTag, qw(vu, kQwGifTag), 16);
+            const int prologue = entryIndex(s, 0, uint32_t(s.particleTag[0]) & 0x7ffu);
+            const int transform = entryIndex(s, 0, uint32_t(s.particleTag[1] >> 32) & 0x7ffu);
+            // The low bits of the tag words are jump targets (JR uses 11 bits; bit 15 is the tag's EOP).
+            s.particleReady = (prologue == 0 || prologue == 1) && transform == 2;
+            static int logged = 0;
+            if (!s.particleReady && logged++ < 4)
+            {
+                const Program &p = s.programs[size_t(s.current[0])];
+                std::fprintf(stderr, "[native] PARTICLEM1 qw301 %08x %08x %08x %08x entries %u %u %u %u\n", uint32_t(s.particleTag[0]),
+                             uint32_t(s.particleTag[0] >> 32), uint32_t(s.particleTag[1]), uint32_t(s.particleTag[1] >> 32), p.entries[0],
+                             p.entries[1], p.entries[2], p.entries[3]);
+            }
+            float vp[16], bone[16];
+            std::memcpy(vp, qw(vu, kQwViewProj), 64);
+            std::memcpy(bone, qw(vu, kQwBones), 64);
+            multiply(vp, bone, s.particleMatrix);
+            const float corners[4][2] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 1.0f}};
+            float r0[4], r1[4];
+            readVec(vu, kQwUvMatrix, r0);
+            readVec(vu, kQwUvMatrix + 1u, r1);
+            for (int i = 0; i < 4; ++i)
+            {
+                const float u = corners[i][0], v = corners[i][1];
+                s.particleUv[i][0] = prologue == 1 ? r0[0] * u + r1[0] * v + r0[3] : u;
+                s.particleUv[i][1] = prologue == 1 ? r0[1] * u + r1[1] * v + r1[3] : v;
+            }
+        }
+        if (!s.particleReady)
+            return decline(s, "entry");
+
+        int32_t header[4];
+        readInts(vu, base, header);
+        const uint32_t count = uint32_t(header[2]);
+        if (count == 0u || count > 85u || uint32_t(header[1]) != count * 4u || uint32_t(header[0]) != count * 2u)
+            return decline(s, "header");
+        GSRawDrawRegisters regs;
+        s.runtime->gs().readRawDrawRegisters(regs);
+        const uint64_t prim = tagPrim(s.particleTag, regs);
+        if (!quadPrimSupported(prim))
+        {
+            char reason[32];
+            std::snprintf(reason, sizeof(reason), "prim%u", unsigned(prim & 7u));
+            return decline(s, reason);
+        }
+
+        float axisA[4], axisB[4], c0[4], c1[4], c2[4], col328[4], col329[4], col330[4], col331[4];
+        float scale[4], offset[4], material[4];
+        readVec(vu, 332u, axisA);
+        readVec(vu, 333u, axisB);
+        readVec(vu, 334u, c0);
+        readVec(vu, 335u, c1);
+        readVec(vu, 336u, c2);
+        readVec(vu, 328u, col328);
+        readVec(vu, 329u, col329);
+        readVec(vu, 330u, col330);
+        readVec(vu, 331u, col331);
+        readVec(vu, kQwScreenScale, scale);
+        readVec(vu, kQwScreenOffset, offset);
+        readVec(vu, kQwMaterial, material);
+        const uint32_t sizeMode = readU32(qw(vu, 332u) + 12) & 0xffffu;
+        const uint32_t colorMode = readU32(qw(vu, 333u) + 12) & 0xffffu;
+        if (sizeMode > 8u || (sizeMode & 1u) || (colorMode != 0u && colorMode != 2u && colorMode != 4u))
+            return decline(s, "mode");
+
+        uint32_t clipAnd = 63u;
+        std::vector<KickVertex> verts;
+        verts.reserve(count * 4u);
+        for (uint32_t k = 0; k < count; ++k)
+        {
+            float p[4];
+            readVec(vu, base + 1u + k, p);
+            const float t = p[3];
+            float sx = 1.0f, sy = 1.0f;
+            switch (sizeMode)
+            {
+            case 2: sx = sy = c0[0] + c1[0] * t; break;
+            case 4: sx = sy = c0[0] + c1[0] * t + c2[0] * (t * t); break;
+            case 6: sx = c0[0] + c1[0] * t; sy = c0[1] + c1[1] * t; break;
+            case 8: sx = c0[0] + c1[0] * t + c2[0] * (t * t); sy = c0[1] + c1[1] * t + c2[1] * (t * t); break;
+            default: break;
+            }
+            float a[3], b[3];
+            for (int c = 0; c < 3; ++c)
+            {
+                a[c] = sizeMode == 0u ? axisA[c] : axisA[c] * sy;
+                b[c] = sizeMode == 0u ? axisB[c] : axisB[c] * sx;
+            }
+            float color[4];
+            for (int c = 0; c < 4; ++c)
+            {
+                if (colorMode == 0u)
+                    color[c] = col328[c];
+                else
+                {
+                    float v = (c == 3 ? 1.0f : 0.0f) + col328[c] + col330[c] * t; // ADDA with vf00 adds 1 to alpha
+                    if (colorMode == 4u)
+                        v += col331[c] * (t * t);
+                    v += col329[c];
+                    color[c] = std::min(std::max(v, c == 3 ? 1.0f : 0.0f), 255.0f);
+                }
+                color[c] *= material[c];
+            }
+            const uint32_t rgba = gsColor(color);
+            KickVertex quad[4];
+            uint32_t any = 0;
+            for (uint32_t i = 0; i < 4u; ++i)
+            {
+                float v[3];
+                for (int c = 0; c < 3; ++c)
+                {
+                    const float side = i < 2u ? p[c] + a[c] : p[c] - a[c];
+                    v[c] = (i & 1u) ? side + b[c] : side - b[c];
+                }
+                float clip[4];
+                transformPoint(s.particleMatrix, v, clip);
+                const uint32_t f = clipFlags(clip);
+                any |= f;
+                clipAnd &= f;
+                const float q = 1.0f / clip[3];
+                toWindow(clip, q, scale, offset, quad[i]);
+                quad[i].rgba = rgba;
+                quad[i].s = s.particleUv[i][0] * q;
+                quad[i].t = s.particleUv[i][1] * q;
+                quad[i].q = q;
+            }
+            if (!any)
+                verts.insert(verts.end(), quad, quad + 4);
+        }
+        if (clipAnd != 0u)
+            verts.clear(); // the batch is culled as a whole: only an empty tag is kicked
+        expectKick(s, verts);
+        submitQuads(s, regs, prim, verts);
+        return true;
+    }
+
+    // PS2X_NATIVE_VERIFY: compare a PATH1 packet with the next one a screen-space port expected.
+    void checkKick(State &s, const uint8_t *data, uint32_t size)
+    {
+        std::lock_guard<std::mutex> lock(s.kickMutex);
+        if (s.expectedNext >= s.expectedKicks.size() || size < 16u)
+            return;
+        const std::vector<KickVertex> &expected = s.expectedKicks[s.expectedNext++];
+        uint64_t tagLo;
+        std::memcpy(&tagLo, data, 8);
+        const uint32_t nloop = uint32_t(tagLo & 0x7fffu);
+        bool bad = nloop != expected.size() || 16u + nloop * 48u > size;
+        uint32_t badVertex = 0;
+        for (uint32_t i = 0; i < nloop && !bad; ++i)
+        {
+            const uint8_t *v = data + 16u + i * 48u;
+            float st[3];
+            uint32_t rgba[4], xyz[3];
+            std::memcpy(st, v, 12);
+            std::memcpy(rgba, v + 16, 16);
+            std::memcpy(xyz, v + 32, 12);
+            const KickVertex &e = expected[i];
+            auto relBad = [](float a, float b, float tol) { return std::fabs(a - b) > tol * std::max(1.0f, std::fabs(b)); };
+            auto near16 = [](uint32_t a, uint32_t b) { return std::abs(int32_t(a & 0xffffu) - int32_t(b & 0xffffu)) <= 2; };
+            uint32_t got = 0;
+            bool colorBad = false;
+            for (int c = 0; c < 4; ++c)
+            {
+                got |= (rgba[c] & 0xffu) << (c * 8);
+                colorBad |= std::abs(int32_t(rgba[c] & 0xffu) - int32_t((e.rgba >> (c * 8)) & 0xffu)) > 1;
+            }
+            if (colorBad || !near16(xyz[0], e.x) || !near16(xyz[1], e.y) ||
+                std::fabs(double(xyz[2]) - double(e.z)) > 2.0 + 1e-4 * double(e.z) || relBad(e.s, st[0], 1e-3f) ||
+                relBad(e.t, st[1], 1e-3f) || relBad(e.q, st[2], 1e-3f))
+            {
+                bad = true;
+                badVertex = i;
+                if (s.kicksMismatched < 10)
+                    std::fprintf(stderr, "[native-verify] kick %s vertex %u: native xyz (%u %u %u) rgba %08x stq (%g %g %g) vu xyz (%u %u %u) rgba %08x stq (%g %g %g)\n",
+                                 s.kickProgram, i, e.x, e.y, e.z, e.rgba, e.s, e.t, e.q, xyz[0] & 0xffffu, xyz[1] & 0xffffu, xyz[2], got,
+                                 st[0], st[1], st[2]);
+            }
+        }
+        if (bad && nloop != expected.size() && s.kicksMismatched < 10)
+            std::fprintf(stderr, "[native-verify] kick %s: native %zu vertices, vu %u\n", s.kickProgram, expected.size(), nloop);
+        (void)badVertex;
+        ++(bad ? s.kicksMismatched : s.kicksVerified);
+        s.kickVertices += nloop;
+    }
+
+    // Called when the next VU1 batch starts: anything still expected was never kicked.
+    void flushKicks(State &s)
+    {
+        std::lock_guard<std::mutex> lock(s.kickMutex);
+        s.kicksMissing += s.expectedKicks.size() - std::min(s.expectedNext, s.expectedKicks.size());
+        s.expectedKicks.clear();
+        s.expectedNext = 0;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last).count() >= 5.0 && (s.kicksVerified || s.kicksMismatched || s.kicksMissing))
+        {
+            std::fprintf(stderr, "[native-verify] kicks matched %llu, mismatched %llu, missing %llu (%llu vertices)\n",
+                         (unsigned long long)s.kicksVerified, (unsigned long long)s.kicksMismatched,
+                         (unsigned long long)s.kicksMissing, (unsigned long long)s.kickVertices);
+            std::string line;
+            for (const auto &d : s.declined)
+                line += " " + d.first + "=" + std::to_string(d.second);
+            if (!line.empty())
+                std::fprintf(stderr, "[native-verify] declined:%s\n", line.c_str());
+            last = now;
+        }
     }
 
     // --- Trace -------------------------------------------------------------------------------------------
@@ -955,7 +1560,7 @@ namespace
             std::memcpy(vuPos, qw(vu, s.pending.base + kInPositions + i), 16);
             // (IDXSTRPD keeps other data there, so only IDXTRID batches are compared; vertices behind the camera
             // (VU depth <= 0) are skipped, since near w = 0 the divide amplifies rounding and the GPU clips them.)
-            const bool comparable = std::strncmp(s.pending.programs, "IDXTRID/", 8) == 0 && vuPos[2] > 0.0f;
+            const bool comparable = (std::strncmp(s.pending.programs, "IDXTRID/", 8) == 0 || std::strncmp(s.pending.programs, "IDXTRIMULTI/", 12) == 0) && vuPos[2] > 0.0f;
             const float posError = !comparable ? 0.0f : std::max(std::fabs(vuPos[0] - s.pending.screen[i][0]), std::fabs(vuPos[1] - s.pending.screen[i][1]));
             if (posError > 2.0f) // GS 12.4 units: 1/8 pixel
             {
@@ -972,12 +1577,12 @@ namespace
             const float stError = std::max(std::fabs(vuSt[0] - s.pending.st[i][0]), std::fabs(vuSt[1] - s.pending.st[i][1]));
             if (stError > 1e-3f)
             {
-                if (s.stMismatched < 12)
+                if (s.stMismatchedBy[s.pending.programs] < 4)
                     std::fprintf(stderr, "[native-verify] st %s variant %d flags 0x%x vertex %u: native (%g %g) vu (%g %g) input (%d %d %d %d) 301.x 0x%08x\n",
                                  s.pending.programs, s.pending.mainVariant, s.pending.flags, i, s.pending.st[i][0],
                                  s.pending.st[i][1], vuSt[0], vuSt[1], s.pending.stInput[i][0], s.pending.stInput[i][1],
                                  s.pending.stInput[i][2], s.pending.stInput[i][3], readU32(qw(vu, kQwGifTag)));
-                if (s.stMismatched < 3)
+                if (s.stMismatchedBy[s.pending.programs] < 2)
                 {
                     float now[8];
                     std::memcpy(now, qw(vu, kQwUvMatrix), 32);
@@ -987,6 +1592,7 @@ namespace
                                  s.pending.rawSt[0], s.pending.rawSt[1]);
                 }
                 ++s.stMismatched;
+                ++s.stMismatchedBy[s.pending.programs];
             }
             s.maxStError = std::max(s.maxStError, stError);
         }
@@ -999,6 +1605,10 @@ namespace
                          s.maxError, (unsigned long long)s.unsupportedLight, (unsigned long long)s.uvTransform,
                          (unsigned long long)s.unsupportedTexgen, (unsigned long long)s.stMismatched, s.maxStError,
                          (unsigned long long)s.posMismatched, s.maxPosError);
+            std::string line;
+            for (const auto &entry : s.stMismatchedBy)
+                line += " " + entry.first + "=" + std::to_string(entry.second);
+            std::fprintf(stderr, "[native-verify] st mismatched by program:%s\n", line.c_str());
             last = now;
         }
     }
@@ -1015,6 +1625,8 @@ namespace
         const uint8_t *vu = s.runtime->memory().getVU1Data();
         if (s.havePending)
             checkPending(s, vu);
+        if (s.verify)
+            flushKicks(s);
         bool freshCall = !event.resume;
         if (!event.resume)
             s.afterInit = event.startPC == 0u;
@@ -1041,6 +1653,12 @@ namespace
         if (ps2native::enabled())
         {
             const MainKind kind = mainKind(s);
+            if (kind == MainKind::Sprite || kind == MainKind::Particle)
+            {
+                s.freshCall = freshCall;
+                const bool handled = kind == MainKind::Sprite ? decodeSprites(s, vu, event.itop) : decodeParticles(s, vu, event.itop);
+                return handled && ps2native::replacesVu1() && !s.verify;
+            }
             bool dequantize = false;
             int normals = 0;
             if (kind != MainKind::Other && supportedXform(s, dequantize, normals))
@@ -1063,6 +1681,8 @@ namespace
         // Full native frame: everything else drawn into the frame (including VU1 output of programs without a
         // native port) is replayed in stream order.
         ps2native::replayGif(path, data, size);
+        if (path == 1u && s.verify)
+            checkKick(s, data, size);
         if (path == 1u || size < 16u)
             return; // PATH1 is the VU1 output (no transfers), already traced as V: tokens
         if (ps2native::enabled())
