@@ -319,5 +319,42 @@ What it looks like today:
 - The title-bar fps counts changed scanouts.
 - The VU1 interpreter still runs for every batch.
 
-Next (M2): `CALCLIGHT` lighting, the texture cache from GS uploads, GS state to pipeline state (blend, alpha
-test, Z), and batch merging.
+**M2 (dual-run verified; replace mode working):**
+- **Lighting and colour.** `CALCLIGHT` is ported to C++ on the CPU in the override:
+  - ambient light, plus directional, point and spot lights, with the nine finalize variants chosen by qw299.y;
+  - texgen modes 0, 1024 and normal (reflection mode 256 is counted but not ported) and the 2x3 UV affine;
+  - `XFORM2M` two-bone blending.
+
+  The per-vertex cost is small: about 160k vertices/s.
+- **Verification.** `PS2X_NATIVE_VERIFY=1` diffs every batch against the VU interpreter's own output:
+  - Colours: 70M+ vertices, 0 mismatches, max error 0.00 (all-zero colours are skipped as culled).
+  - Positions: about 0.15% of `IDXTRID` vertices differ, all near w = 0, which GPU clipping handles.
+  - ST: about 0.4% differ, all on batches with a UV scroll matrix that the interpreter does not apply. The
+    program reads the flag word with `ILW` in a branch delay slot, and the interpreter's load latency makes the
+    next check see a stale value. Native applies the matrix. Whether the hardware or the interpreter is right
+    is open.
+- **Textures.** A CPU shadow of GS memory runs on its own thread (`native_textures.cpp`).
+  - It is fed in stream order with every GIF packet, including the two GIF DMA fast paths in `ps2_memory.cpp`
+    that bypass the arbiter, and `HWREG` uploads.
+  - Swizzling uses the new `GSMem::WriteRow`/`ReadRow`.
+  - Decoded textures are keyed by the content of the texture's own 256-byte blocks plus format and palette.
+    The game streams about 7.5k small uploads/s through a VRAM LRU, so address-keyed caches thrash.
+  - `PS2X_NATIVE_SHADOWCHECK=1` compares the shadow with parallel-gs VRAM; sampled CLUTs and texels match exactly.
+- **GS state.** TFX/TCC, alpha test (AFAIL KEEP discards), Z test and mask, FBMSK, FBA and the expressible
+  ALPHA blend equations are mapped. Framebuffer alpha stores As/0x80 so DST_ALPHA blends work.
+- **`PS2X_NATIVE3D=3` (replace).** Handled batches skip the VU1 interpreter entirely. In matches the game then
+  draws 45-55 distinct frames/s instead of about 28 (dual-run, worker saturated).
+- **Debug aids.** `PS2X_NATIVE_DEBUGVIEW=1` tints draws with a missing texture (magenta), a black texture
+  (cyan) or black vertex colours (yellow). `PS2X_NATIVE_TEXSTATS=1` prints texture-cache counters.
+
+**Known gaps** (visible in native-only modes):
+- Some objects (statues, parts of characters) are drawn by the VU with zero vertex colour. Their emulated
+  colour comes from other draws that native-only mode does not show: direct GS (PATH2) primitive packets in
+  the 3D phase, or the unported `IDXTRIMULTI`/`SPRITEM1`/`PARTICLEM1` passes. The GS state at XGKICK time
+  matches the state captured at MSCAL (checked over 14.5M batches).
+- The 2D full-screen passes are absent, so native-only frames look darker.
+- No batch merging yet: about 350 draws per frame, which is fine so far.
+
+Next:
+- **M3:** `IDXTRIMULTI` second pass, `SPRITEM1`, `PARTICLEM1` and toon/halo.
+- **M4:** composite with the emulated non-VU draws, keeping their order relative to native draws.
