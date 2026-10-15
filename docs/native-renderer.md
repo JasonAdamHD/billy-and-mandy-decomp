@@ -345,7 +345,9 @@ What it looks like today:
 - **`PS2X_NATIVE3D=3` (replace).** Handled batches skip the VU1 interpreter entirely. In matches the game then
   draws 45-55 distinct frames/s instead of about 28 (dual-run, worker saturated).
 - **Debug aids.** `PS2X_NATIVE_DEBUGVIEW=1` tints draws with a missing texture (magenta), a black texture
-  (cyan) or black vertex colours (yellow). `PS2X_NATIVE_TEXSTATS=1` prints texture-cache counters.
+  (cyan), black vertex colours (yellow) or a blend equation with no fixed-function mapping (red).
+  `PS2X_NATIVE_BLENDLOG=1` logs each such unmapped ALPHA value once, with the draw that uses it.
+  `PS2X_NATIVE_TEXSTATS=1` prints texture-cache counters.
 
 **Known gaps** (visible in native-only modes):
 - Some objects (statues, parts of characters) are drawn by the VU with zero vertex colour. Their emulated
@@ -419,6 +421,21 @@ What it looks like today:
   are counted under `declined:`). The MULTI pass-2 colours are exact (0 colour mismatches over 46M vertices).
 - **Speed.** In Underworld the VU1 interpreter time fell from about 830 ms/s to 0 ms/s, and the game now
   runs at 54-59 frames/s instead of 23-40.
+
+**Black floor shapes late in matches (fixed).** On Warlockery and Sorcerizing, dark quads appeared on the
+floor and around effects once the fighting started.
+- **Cause.** The game draws them with the subtractive blend `ALPHA = 0xa1`, which is (Cd - Cs) * FIX >> 7
+  with FIX = 0x80. The compositor had no mapping for it, so it drew the dark source colour opaque.
+- **Draw path.** These are ordinary textured VU mesh batches (triangle lists in context 2, three XFORM
+  variants). Neither the `SPRITEM1`/`PARTICLEM1` ports nor the GS replay is involved; the blend mapping in
+  `native_compose.cpp` is shared by every path.
+- **Fix.** `applyBlend` now also maps these equations:
+  - (Cd - Cs) * C and (Cs - Cd) * C, as reverse/forward subtract;
+  - Cd * C and Cd * (1 - C);
+  - Cs - Cd * C;
+  - -B * C (black).
+
+  Still unmapped: Cs * (1 + C), Cd * (1 + C), (Cs - Cd) * C + Cs and (Cd - Cs) * C + Cd.
 
 **Levels checked** in `PS2X_NATIVE3D=4`:
 - Egyptian Tomb, Underworld ("Deep in Evil", `down` twice on the level screen) and Warlockery and
