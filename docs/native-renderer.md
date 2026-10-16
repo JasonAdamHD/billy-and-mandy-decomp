@@ -469,7 +469,20 @@ debug panel, which otherwise covers screenshots.
 - Reflection texgen (mode 256).
 - Render-to-texture sampling (none seen).
 - Speed ports for TOON/HALO, `PARTDIST` and `XFORM4M`/`EXTN` (not seen at a significant rate yet).
-- Upscaling: the native target is still 640x448.
+
+**Resolution and widescreen.**
+- `PS2X_RES_SCALE=<1..8>` renders the native frame at that multiple of the PS2 resolution. Vertices stay in
+  GS window units, so only the render target, scissors and scanout copies scale. The presenter reads back
+  full-size frames, grows its texture to fit and draws with bilinear filtering, which also downsamples
+  supersampled frames.
+- `PS2X_WIDESCREEN=1` gives 16:9:
+  - `overrides/billy_mandy_overrides.cpp` wraps `AtGrBuildPerspectiveFrustumMatrix` (0x437F30) and narrows
+    its x scale by 3/4. Every projection in the game comes from it (all 4:3), and the game's frustum culling
+    uses the same matrix, so the extra width is drawn.
+  - The frame is rendered 4/3 wider and presented at 16:9.
+  - Screen-space draws (HUD, menus) are narrowed back to their 4:3 proportions about the centre. Draws that
+    cover the full width (backgrounds, fades) stay full width.
+- `play_native.ps1` defaults to 2x and widescreen (`-Scale`, `-FourByThree`).
 
 ## 9. M3 program notes (from the disassembly, for later speed ports)
 - **MULTI/STRPMUL.** Pass 1 is the base emit, with qw301.x selecting the second UV set (zw of 161+). Pass 2

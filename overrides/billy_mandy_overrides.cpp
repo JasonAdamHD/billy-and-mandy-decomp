@@ -146,8 +146,57 @@ namespace
         g_originalSoundUpdateB(rdram, ctx, runtime);
     }
 
+    // Widescreen (PS2X_WIDESCREEN=1): AtGrBuildPerspectiveFrustumMatrix(near f12, far f13, out a0, window a1 =
+    // {left, top, right, bottom}, screen a2 = {sx, sy}, offset a3 = {ox, oy}) builds every perspective projection.
+    // Narrowing its x scale by 3/4 widens the horizontal field of view to 16:9; the game's own frustum culling
+    // uses the same matrix, so the extra width is drawn and kept. The runtime then presents the frame at 16:9.
+    constexpr uint32_t kBuildPerspectiveFrustumMatrix = 0x00437F30u;
+    PS2Runtime::RecompiledFunction g_originalBuildPerspective = nullptr;
+
+    float readGuestFloat(const uint8_t *rdram, uint32_t address)
+    {
+        const uint32_t bits = readGuest32(rdram, address);
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    void buildPerspectiveWidescreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t out = GPR_U32(ctx, 4), window = GPR_U32(ctx, 5), screen = GPR_U32(ctx, 6), offset = GPR_U32(ctx, 7);
+        g_originalBuildPerspective(rdram, ctx, runtime);
+        static const bool log = std::getenv("PS2X_WIDESCREEN_LOG") != nullptr;
+        if (log)
+        {
+            static uint32_t logged = 0u;
+            if (logged++ < 40u)
+                std::cerr << "[widescreen] window (" << readGuestFloat(rdram, window) << "," << readGuestFloat(rdram, window + 4u) << ")-("
+                          << readGuestFloat(rdram, window + 8u) << "," << readGuestFloat(rdram, window + 12u) << ") screen ("
+                          << readGuestFloat(rdram, screen) << "," << readGuestFloat(rdram, screen + 4u) << ") offset ("
+                          << readGuestFloat(rdram, offset) << "," << readGuestFloat(rdram, offset + 4u) << ") ra 0x" << std::hex
+                          << GPR_U32(ctx, 31) << std::dec << std::endl;
+        }
+        const uint32_t m0 = out & 0x01FFFFFFu, m8 = (out + 32u) & 0x01FFFFFFu;
+        if (m8 + sizeof(float) > PS2_RAM_SIZE)
+            return;
+        const float ox = readGuestFloat(rdram, offset);
+        float scaleX, shearX;
+        std::memcpy(&scaleX, rdram + m0, sizeof(float));
+        std::memcpy(&shearX, rdram + m8, sizeof(float));
+        scaleX *= 0.75f;
+        shearX = ox + (shearX - ox) * 0.75f;
+        std::memcpy(rdram + m0, &scaleX, sizeof(float));
+        std::memcpy(rdram + m8, &shearX, sizeof(float));
+    }
+
     void applyBillyMandyOverrides(PS2Runtime &runtime)
     {
+        if (const char *wide = std::getenv("PS2X_WIDESCREEN"); wide && std::atoi(wide) != 0)
+        {
+            g_originalBuildPerspective = runtime.lookupFunction(kBuildPerspectiveFrustumMatrix);
+            if (g_originalBuildPerspective != nullptr)
+                runtime.replaceFunction(kBuildPerspectiveFrustumMatrix, &buildPerspectiveWidescreen);
+        }
         if (std::getenv("PS2X_NO_SOUND_WAIT_GUARD") == nullptr)
         {
             g_originalSoundUpdateA = runtime.lookupFunction(kSoundUpdateA);
