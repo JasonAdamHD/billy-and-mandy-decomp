@@ -1,7 +1,6 @@
 # Online play (netplay)
 
-Two players, each with their own copy of the game and the same build, play the Vs/Mission modes together over
-the internet. Every PC runs the whole game; only controller inputs travel. Implementation:
+Two to four players, each with their own copy of the game and the same build, play together over the internet. Every PC runs the whole game; only controller inputs travel. Implementation:
 `PS2Recomp/ps2xRuntime/src/lib/ps2_netplay.cpp` (header `runtime/ps2_netplay.h`).
 
 ## Playing
@@ -13,7 +12,8 @@ powershell -ExecutionPolicy Bypass -File .\play_native.ps1 -HostGame
 powershell -ExecutionPolicy Bypass -File .\play_native.ps1 -Join <host IP>
 ```
 
-Options: `-Port` (default 7777) and `-Delay` (input delay in frames, default 3; raise it on a slow connection).
+Options: `-Players 2..4` (host; default 2), `-Port` (default 7777) and `-Delay` (input delay in frames, default
+3; raise it on a slow connection). Friends join in any order; the first to join is player 2.
 The host's window waits until the friend has joined; the game then starts on both PCs together.
 
 Both players use a temporary copy of the **host's** memory card, which is sent to the friend at the start, so the
@@ -27,7 +27,9 @@ unlocks and settings are the host's. Nobody's real save is written during netpla
   lost packets are covered without acknowledgements.
 - **Desync detection.** Every 60 frames each PC hashes the 32 MB of EE RAM and sends the hash. A mismatch is
   logged as `[netplay] DESYNC`.
-- **Session start.** Clients say hello, and the host assigns pad ports. Clients download the host's memory card
+- **Players and pads.** Player N is slot N of an emulated multitap in pad port 1 (the game supports 4 players
+  through the multitap on a real PS2).
+- **Session start.** Clients say hello, and the host assigns player numbers. Clients download the host's memory card
   (1 KB chunks), and the host starts everyone at frame 1.
 
 ## What makes the game deterministic
@@ -45,7 +47,16 @@ record/replay) changes the runtime as follows:
 | GIF/VIF1 DMA completion on the graphics worker thread | Graphics work stays on the EE thread |
 
 Two replays of the same input recording produce identical RAM for 12,500+ frames (boot, menus, loading and a
-fight). Two local instances connected over UDP stayed in sync for a whole session.
+fight). Two and three local instances connected over UDP stayed in sync for whole sessions (3-player fight
+included). Three instances on one PC run below full speed, because each runs the full game; separate PCs don't
+share that load.
+
+## Local multiplayer (one PC)
+
+The same multitap gives up to 4 players on one PC. Player 1 is the keyboard or first gamepad, and players 2-4 are
+gamepads 2-4. The game answers `sceMtapGetConnection` from `overrides/billy_mandy_overrides.cpp`, and the pad
+stubs report one slot per connected gamepad. `PS2X_MULTITAP=0` turns the multitap off (players 1-2 on pad ports
+1-2, as before).
 
 ## Testing tools
 
@@ -58,7 +69,6 @@ first differing frame and find the code that writes the differing addresses.
 
 ## Limits / next steps
 
-- Two players: pad ports 3-4 need multitap emulation (`mtapman.irx`).
 - Delay-based only. Rollback would need save states of the whole runtime (EE RAM and registers, IOP, SPU2,
   GS/VRAM, scheduler).
 - No relay server or NAT traversal: the host must accept inbound UDP.

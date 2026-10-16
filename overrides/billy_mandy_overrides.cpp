@@ -2,6 +2,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ps2_pad.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -189,8 +190,27 @@ namespace
         std::memcpy(rdram + m8, &shearX, sizeof(float));
     }
 
+    // Multitap: the game asks mtapman (IOP) whether a multitap is plugged in and, if so, reads players 1-4 from
+    // its slots. The runtime emulates one in pad port 1 (local players 2-4 on gamepads 2-4, and netplay players).
+    constexpr uint32_t kMtapPortOpen = 0x0011F610u;      // sceMtapPortOpen(port)
+    constexpr uint32_t kMtapGetConnection = 0x0011F7D0u; // sceMtapGetConnection(port): 1 = connected
+
+    void mtapPortOpen(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, 1u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    void mtapGetConnection(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        SET_GPR_U32(ctx, 2, ps2PadMultitapConnected(static_cast<int>(GPR_U32(ctx, 4))) ? 1u : 0u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
     void applyBillyMandyOverrides(PS2Runtime &runtime)
     {
+        runtime.replaceFunction(kMtapPortOpen, &mtapPortOpen);
+        runtime.replaceFunction(kMtapGetConnection, &mtapGetConnection);
         if (const char *wide = std::getenv("PS2X_WIDESCREEN"); wide && std::atoi(wide) != 0)
         {
             g_originalBuildPerspective = runtime.lookupFunction(kBuildPerspectiveFrustumMatrix);
