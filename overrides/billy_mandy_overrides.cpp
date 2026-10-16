@@ -146,61 +146,8 @@ namespace
         g_originalSoundUpdateB(rdram, ctx, runtime);
     }
 
-    // The vector-normalise helpers detect a zero-length input through the VU0 MAC flag Zx (CFC2 $17 & 8, set by
-    // the VADDq.x that copies sqrt(length^2)) and then return a fixed unit vector instead of the scaled input.
-    // The recompiler does not update MAC flags for VU0 macro instructions; CFC2 $17 returns whatever the last
-    // VU0 microprogram run (VCALLMS, interpreted) left behind. With a stale Zx the helpers returned (1,0,0) and
-    // length 0 for ordinary vectors, which flipped the path camera between stages every few frames. Set the flags
-    // the VADDq.x would produce before the helper runs: Zx exactly when the length is zero (the field is x only,
-    // and a square root is never negative, so no other bit is set).
-    struct NormalizeHelper
-    {
-        uint32_t address;
-        int srcReg; // GPR holding the source vector (4 = a0, 5 = a1)
-        bool fourD; // length over xyzw (the *VU0 variants) instead of xyz
-        PS2Runtime::RecompiledFunction original;
-    };
-    NormalizeHelper g_normalizeHelpers[] = {
-        {0x003BF360u, 5, true, nullptr},  // NormalizeVector4VU0(dst, src)
-        {0x003BF3B0u, 4, true, nullptr},  // NormalizeVector4InPlaceVU0(v)
-        {0x003C01D0u, 5, false, nullptr}, // NormalizeVector4ToDestReturnLength(dst, src)
-        {0x003C0230u, 4, false, nullptr}, // NormalizeVector4InPlaceReturnLength(v)
-        {0x003C0290u, 5, false, nullptr}, // NormalizeVector4ToDest(dst, src)
-        {0x003C02E0u, 4, false, nullptr}, // NormalizeVector4InPlace(v)
-    };
-
-    template <size_t I>
-    void normalizeWithMacFlags(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-    {
-        const NormalizeHelper &h = g_normalizeHelpers[I];
-        const uint32_t src = GPR_U32(ctx, h.srcReg) & 0x01FFFFFFu;
-        float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        if (src + sizeof(v) <= PS2_RAM_SIZE)
-            std::memcpy(v, rdram + src, sizeof(v));
-        // length^2 as the VU sums it; the VU flushes results below the normal range to zero.
-        float lengthSquared = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-        if (h.fourD)
-            lengthSquared += v[3] * v[3];
-        ctx->vu0_mac_flags = lengthSquared < 1.17549435e-38f ? 0x8u : 0u;
-        h.original(rdram, ctx, runtime);
-    }
-
-    template <size_t... I>
-    void installNormalizeChecks(PS2Runtime &runtime, std::index_sequence<I...>)
-    {
-        const PS2Runtime::RecompiledFunction wrappers[] = {&normalizeWithMacFlags<I>...};
-        for (size_t i = 0; i < sizeof...(I); ++i)
-        {
-            g_normalizeHelpers[i].original = runtime.lookupFunction(g_normalizeHelpers[i].address);
-            if (g_normalizeHelpers[i].original != nullptr)
-                runtime.replaceFunction(g_normalizeHelpers[i].address, wrappers[i]);
-        }
-    }
-
     void applyBillyMandyOverrides(PS2Runtime &runtime)
     {
-        if (std::getenv("PS2X_NO_NORMALIZE_MAC_FIX") == nullptr)
-            installNormalizeChecks(runtime, std::make_index_sequence<sizeof(g_normalizeHelpers) / sizeof(g_normalizeHelpers[0])>{});
         if (std::getenv("PS2X_NO_SOUND_WAIT_GUARD") == nullptr)
         {
             g_originalSoundUpdateA = runtime.lookupFunction(kSoundUpdateA);
@@ -222,4 +169,4 @@ namespace
     }
 }
 
-PS2_REGISTER_GAME_OVERRIDE("Billy & Mandy: skip Sofdec FMVs, guard Flash level walk and stuck sound loads, normalise MAC flags", "SLUS_214.51", 0u, 0u, &applyBillyMandyOverrides)
+PS2_REGISTER_GAME_OVERRIDE("Billy & Mandy: skip Sofdec FMVs, guard Flash level walk and stuck sound loads", "SLUS_214.51", 0u, 0u, &applyBillyMandyOverrides)
