@@ -12,8 +12,9 @@ powershell -ExecutionPolicy Bypass -File .\play_native.ps1 -HostGame
 powershell -ExecutionPolicy Bypass -File .\play_native.ps1 -Join <host IP>
 ```
 
-Options: `-Players 2..4` (host; default 2), `-Port` (default 7777) and `-Delay` (input delay in frames, default
-3; raise it on a slow connection). Friends join in any order; the first to join is player 2.
+Options: `-Players 2..4` (host; default 2), `-Port` (default 7777) and `-Delay` (input delay in frames). The
+delay is normally automatic: once everyone has joined, the host pings each player for half a second and picks it.
+Friends join in any order; the first to join is player 2.
 The host's window waits until the friend has joined; the game then starts on both PCs together.
 
 Both players use a temporary copy of the **host's** memory card, which is sent to the friend at the start, so the
@@ -24,7 +25,11 @@ unlocks and settings are the host's. Nobody's real save is written during netpla
 - **Lockstep.** Pad inputs are latched once per emulated vsync. A player's input for frame T is sampled at frame
   T - delay and sent to the others, so it has usually arrived by the time frame T runs. If not, the frame waits.
   The host relays packets between players (star topology). Each packet repeats the sender's last 16 frames, so
-  lost packets are covered without acknowledgements.
+  lost packets are covered without acknowledgements. A network thread receives, relays and answers packets as
+  they arrive.
+- **Automatic input delay.** An input from one client reaches another through the host, so the slowest path
+  is the two largest one-way latencies. The host measures each client's round trip (90th percentile, to cover
+  jitter) and picks `ceil((path + 4 ms) / frame) + 1` frames.
 - **Desync detection.** Every 60 frames each PC hashes the 32 MB of EE RAM and sends the hash. A mismatch is
   logged as `[netplay] DESYNC`.
 - **Players and pads.** Player N is slot N of an emulated multitap in pad port 1 (the game supports 4 players
@@ -51,6 +56,23 @@ fight). Two and three local instances connected over UDP stayed in sync for whol
 included). Three instances on one PC run below full speed, because each runs the full game; separate PCs don't
 share that load.
 
+## Network tests
+
+The tests ran 4 instances on one PC (host plus 3 clients) with simulated links (`PS2X_NETPLAY_SIM_PING`,
+`_JITTER`, `_LOSS`: each client delays its sent and received packets). Each run lasted about 4 minutes, from boot
+through menus into a 4-player fight. The stats lines (`[netplay] stats tick ...`) log the fps, the frames that
+waited for input and the measured ping every 10 s.
+
+| Clients' pings | Jitter / loss | Delay | Speed | Waits | Desyncs |
+|---|---|---|---|---|---|
+| 0 / 0 / 0 ms | none | 3 | ~58 fps | clients ~5 ms on 1 frame in 4 (alignment) | 0 |
+| 30 / 60 / 80 ms | none | 3 (fixed, before the network thread) | **~39 fps** | most frames, up to 85 ms | 0 |
+| 30 / 60 / 80 ms | none | 6 (auto) | ~59 fps | rare, mostly < 10 ms | 0 |
+| 30 / 60 / 80 ms | +/-10 ms, 2% | 6 (auto, 90th percentile) | ~58 fps | 3-8% of frames, ~7 ms | 0 |
+
+Too small a delay slows every player to the pace of the slowest path. With the automatic delay, the cost of
+high pings is input lag (6 frames = 100 ms at 30/60/80 ms) instead of slowdown. Lowering that lag needs rollback.
+
 ## Local multiplayer (one PC)
 
 The same multitap gives up to 4 players on one PC. Player 1 is the keyboard or first gamepad, and players 2-4 are
@@ -72,4 +94,5 @@ first differing frame and find the code that writes the differing addresses.
 - Delay-based only. Rollback would need save states of the whole runtime (EE RAM and registers, IOP, SPU2,
   GS/VRAM, scheduler).
 - No relay server or NAT traversal: the host must accept inbound UDP.
+- The delay is chosen once, at session start; it does not adapt if a connection gets worse during play.
 - A player who drops out has an idle pad from then on.
